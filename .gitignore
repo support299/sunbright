@@ -6,3 +6,7 @@ venv
 **/__pycache__/**
 *.pyc
 *.pyc**
+
+# Python cache
+__pycache__/
+*.py[cod]

@@ -95,5 +95,8 @@ GOOGLE_OAUTH_ADMIN_EMAILS = frozenset(
 )
 
 # AI insights (POST /api/insights/generate/): without BUILT_IN_FORGE_API_KEY, responses use local heuristics from DB metrics.
-# With key: OpenAI-compatible Forge API (same env names as sunbright-dashboard). Optional: BUILT_IN_FORGE_API_URL,
-# BUILT_IN_FORGE_MODEL, BUILT_IN_FORGE_TIMEOUT_SECONDS (default 120).
+# With key: chat completions API (Forge default, or OpenAI). Same env names as sunbright-dashboard for Forge.
+# Optional: BUILT_IN_FORGE_API_URL, BUILT_IN_FORGE_MODEL, BUILT_IN_FORGE_TIMEOUT_SECONDS (default 120).
+# OpenAI: set BUILT_IN_FORGE_API_URL=https://api.openai.com and BUILT_IN_FORGE_MODEL=gpt-4o-mini (or gpt-4o, etc.).
+# Forge-only `thinking` is omitted automatically when the URL contains openai.com (or set BUILT_IN_FORGE_SKIP_THINKING=true).
+# max_tokens defaults to 16384 for api.openai.com (model limit); override with BUILT_IN_FORGE_MAX_TOKENS if needed.

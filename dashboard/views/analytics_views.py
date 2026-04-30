@@ -3,6 +3,11 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from dashboard.permissions import IsDashboardAdmin
+from dashboard.serializers.insight_chat_serializer import (
+    InsightChatRequestSerializer,
+    InsightConversationSerializer,
+    InsightMessageSerializer,
+)
 from dashboard.serializers.project_serializer import ProjectSerializer
 from dashboard.services.analytics_service import (
     get_clean_deals_bundle,
@@ -13,7 +18,15 @@ from dashboard.services.analytics_service import (
     get_retention_bundle,
 )
 from dashboard.services.project_service import get_cancelled_projects, get_on_hold_projects
-from dashboard.services.insights_service import InsightsLLMError, generate_dashboard_insights
+from dashboard.services.insights_service import (
+    InsightsConversationError,
+    InsightsLLMError,
+    InsightsRateLimitError,
+    chat_with_insights_assistant,
+    generate_dashboard_insights,
+    list_insight_conversations,
+    list_insight_messages,
+)
 from dashboard.services.sunbase_sync_service import get_last_sync_result, run_full_sync
 from dashboard.utils import error_response, parse_dashboard_date_range, success_response
 
@@ -109,3 +122,49 @@ class DataSyncView(APIView):
 
     def get(self, request):
         return Response(success_response({"lastResult": get_last_sync_result()}))
+
+
+class InsightsChatView(APIView):
+    permission_classes = [IsAuthenticated, IsDashboardAdmin]
+
+    def post(self, request):
+        serializer = InsightChatRequestSerializer(data=request.data or {})
+        serializer.is_valid(raise_exception=True)
+        payload = serializer.validated_data
+        try:
+            data = chat_with_insights_assistant(
+                user=request.user,
+                message=payload.get("message", ""),
+                conversation_id=payload.get("conversationId"),
+                date_from=payload.get("dateFrom"),
+                date_to=payload.get("dateTo"),
+            )
+        except InsightsRateLimitError as exc:
+            return Response(error_response([{"field": "rateLimit", "message": str(exc)}]), status=429)
+        except InsightsConversationError:
+            return Response(error_response([{"field": "conversation", "message": "Conversation not found."}]), status=404)
+        except InsightsLLMError:
+            return Response(
+                error_response([{"field": "llm", "message": "I’m having trouble generating insights right now. Please try again."}]),
+                status=502,
+            )
+        return Response(success_response(data))
+
+
+class InsightsConversationListView(APIView):
+    permission_classes = [IsAuthenticated, IsDashboardAdmin]
+
+    def get(self, request):
+        rows = list_insight_conversations(request.user)
+        return Response(success_response(InsightConversationSerializer(rows, many=True).data))
+
+
+class InsightsConversationMessagesView(APIView):
+    permission_classes = [IsAuthenticated, IsDashboardAdmin]
+
+    def get(self, request, conversation_id):
+        try:
+            rows = list_insight_messages(request.user, conversation_id)
+        except InsightsConversationError:
+            return Response(error_response([{"field": "conversation", "message": "Conversation not found."}]), status=404)
+        return Response(success_response(InsightMessageSerializer(rows, many=True).data))

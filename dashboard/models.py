@@ -171,3 +171,65 @@ class SyncRun(models.Model):
 
     class Meta:
         ordering = ["-timestamp"]
+
+
+class InsightConversation(TimeStampedSoftDeleteModel):
+    class Status(models.TextChoices):
+        ACTIVE = "active", "Active"
+        ARCHIVED = "archived", "Archived"
+        CLOSED = "closed", "Closed"
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="insight_conversations",
+    )
+    title = models.CharField(max_length=255, blank=True)
+    date_from = models.DateField(null=True, blank=True)
+    date_to = models.DateField(null=True, blank=True)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.ACTIVE)
+    scope_snapshot = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ["-updated_at"]
+
+    def __str__(self):
+        return self.title or f"Conversation {self.id}"
+
+
+class InsightMessage(TimeStampedSoftDeleteModel):
+    class Role(models.TextChoices):
+        SYSTEM = "system", "System"
+        USER = "user", "User"
+        ASSISTANT = "assistant", "Assistant"
+        TOOL = "tool", "Tool"
+
+    class IntentLabel(models.TextChoices):
+        DASHBOARD_QUERY = "DASHBOARD_QUERY", "Dashboard query"
+        GREETING_SMALLTALK = "GREETING_SMALLTALK", "Greeting or smalltalk"
+        OUT_OF_SCOPE = "OUT_OF_SCOPE", "Out of scope"
+
+    conversation = models.ForeignKey(
+        InsightConversation,
+        on_delete=models.CASCADE,
+        related_name="messages",
+    )
+    role = models.CharField(max_length=16, choices=Role.choices)
+    content = models.TextField()
+    rendered_prompt = models.TextField(blank=True)
+    context_meta = models.JSONField(default=dict, blank=True)
+    intent_label = models.CharField(max_length=24, choices=IntentLabel.choices, blank=True)
+    provider = models.CharField(max_length=64, blank=True)
+    model = models.CharField(max_length=128, blank=True)
+    latency_ms = models.IntegerField(default=0)
+    token_input = models.IntegerField(default=0)
+    token_output = models.IntegerField(default=0)
+    finish_reason = models.CharField(max_length=64, blank=True)
+    error_payload = models.JSONField(null=True, blank=True)
+    safety_flags = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ["created_at"]
+
+    def __str__(self):
+        return f"{self.role} message #{self.id}"

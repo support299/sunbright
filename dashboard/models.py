@@ -17,6 +17,49 @@ class TimeStampedSoftDeleteModel(models.Model):
         self.save(update_fields=["deleted_at", "updated_at"])
 
 
+class Installer(models.Model):
+    name = models.CharField(max_length=255, unique=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+
+class LeadSource(models.Model):
+    name = models.CharField(max_length=255, unique=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+
+class Team(models.Model):
+    name = models.CharField(max_length=255, unique=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+
+class Rep(models.Model):
+    name = models.CharField(max_length=255, unique=True)
+    team = models.ForeignKey(
+        Team, on_delete=models.SET_NULL, null=True, blank=True, related_name="reps"
+    )
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+
 class Project(TimeStampedSoftDeleteModel):
     first_name = models.CharField(max_length=255, blank=True)
     last_name = models.CharField(max_length=255, blank=True)
@@ -24,20 +67,57 @@ class Project(TimeStampedSoftDeleteModel):
     sales_team = models.CharField(max_length=255, blank=True)
     installer = models.CharField(max_length=255, blank=True)
     lead_source = models.CharField(max_length=255, blank=True)
+    setter = models.CharField(max_length=255, blank=True)
+    project_manager = models.CharField(max_length=255, blank=True)
     job_status = models.CharField(max_length=255)
     project_category = models.CharField(max_length=64)
+    stage_bucket = models.CharField(max_length=64, blank=True, db_index=True)
     contract_amount = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)
     customer_since = models.DateField(null=True, blank=True)
     install_date = models.DateField(null=True, blank=True)
     site_survey_scheduled = models.DateField(null=True, blank=True)
+    site_survey_submitted = models.DateField(null=True, blank=True)
+    site_survey_approved = models.DateField(null=True, blank=True)
+    site_survey_results = models.DateField(null=True, blank=True)
+    cio_date = models.DateField(null=True, blank=True)
+    engineering_date = models.DateField(null=True, blank=True)
     crc_date = models.DateField(null=True, blank=True)
+    permit_submitted = models.DateField(null=True, blank=True)
     permit_approved = models.DateField(null=True, blank=True)
+    insurance_approved = models.DateField(null=True, blank=True)
     install_completed = models.DateField(null=True, blank=True)
+    inspection_scheduled = models.DateField(null=True, blank=True)
+    inspection_passed = models.DateField(null=True, blank=True)
+    ready_for_pto = models.DateField(null=True, blank=True)
     pto_submitted = models.DateField(null=True, blank=True)
+    pto_approved = models.DateField(null=True, blank=True)
+    cancelled_date = models.DateField(null=True, blank=True)
     cancellation_reason = models.CharField(max_length=255, blank=True)
     on_hold_reason = models.CharField(max_length=255, blank=True)
     is_clean_deal = models.BooleanField(default=False)
+    is_quick_install = models.BooleanField(default=False)
     is_active = models.BooleanField(default=False)
+    sunbase_job_uuid = models.CharField(max_length=64, blank=True, db_index=True)
+    installer_ref = models.ForeignKey(
+        Installer,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="projects",
+    )
+    lead_source_ref = models.ForeignKey(
+        LeadSource,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="projects",
+    )
+    rep = models.ForeignKey(
+        Rep, on_delete=models.SET_NULL, null=True, blank=True, related_name="projects"
+    )
+    team = models.ForeignKey(
+        Team, on_delete=models.SET_NULL, null=True, blank=True, related_name="projects"
+    )
 
     class Meta:
         ordering = ["-id"]
@@ -48,10 +128,18 @@ class Project(TimeStampedSoftDeleteModel):
 
 class CxProject(TimeStampedSoftDeleteModel):
     row_number = models.IntegerField(null=True, blank=True)
+    sunbase_job_uuid = models.CharField(max_length=64, blank=True, db_index=True)
     first_name = models.CharField(max_length=255, blank=True)
     last_name = models.CharField(max_length=255, blank=True)
     job_status = models.CharField(max_length=255, blank=True)
     installer = models.CharField(max_length=255, blank=True)
+    installer_ref = models.ForeignKey(
+        Installer,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="cx_projects",
+    )
     install_date = models.DateField(null=True, blank=True)
     install_completed = models.DateField(null=True, blank=True)
     inspection_scheduled = models.DateField(null=True, blank=True)
@@ -108,6 +196,19 @@ class Appointment(TimeStampedSoftDeleteModel):
     sales_rep = models.CharField(max_length=255, blank=True)
     setter = models.CharField(max_length=255, blank=True)
     sales_team = models.CharField(max_length=255, blank=True)
+    rep = models.ForeignKey(
+        Rep, on_delete=models.SET_NULL, null=True, blank=True, related_name="appointments"
+    )
+    team = models.ForeignKey(
+        Team, on_delete=models.SET_NULL, null=True, blank=True, related_name="appointments"
+    )
+    lead_source_ref = models.ForeignKey(
+        LeadSource,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="appointments",
+    )
     is_blitz_deal = models.BooleanField(default=False)
     is_self_set = models.BooleanField(default=False)
     stage_category = models.CharField(max_length=50, blank=True)
@@ -160,6 +261,36 @@ class DashboardDataScope(models.Model):
 
     def __str__(self):
         return f"Scope({self.user_id}, {self.scope_kind})"
+
+
+class SunbaseUser(models.Model):
+    external_uuid = models.CharField(max_length=64, unique=True)
+    full_name = models.CharField(max_length=255, blank=True)
+    role = models.CharField(max_length=255, blank=True)
+    login_allowed = models.BooleanField(default=False)
+    manager_name = models.CharField(max_length=255, blank=True)
+    crew_name = models.CharField(max_length=255, blank=True)
+    rep = models.ForeignKey(
+        Rep,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="sunbase_users",
+    )
+    team = models.ForeignKey(
+        Team,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="sunbase_users",
+    )
+    last_synced_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["full_name", "external_uuid"]
+
+    def __str__(self):
+        return self.full_name or self.external_uuid
 
 
 class SyncRun(models.Model):

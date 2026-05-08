@@ -8,13 +8,57 @@ from urllib.request import urlopen
 
 from django.utils import timezone
 
-from dashboard.models import Appointment, CxProject, Door, Project, SyncRun
+from dashboard.models import Appointment, CxProject, Door, Project, SunbaseUser, SyncRun
 
 BASE_URL = "https://server2.sunbasedata.com/sunbase/portal/api/dao"
 JOB_LIST_KEY = "6ee21c0ccc5f4562bc5f29fa94eb6900"
 CX_EXPERIENCE_KEY = "280ffb72dbae4ff0b15ac53d6027692c"
 DOORS_LIST_KEY = "17d317dccb734d17931b8e55042643d1"
 APPOINTMENT_STATUS_KEY = "51944068795144e38b0757bdc9123901"
+USERS_REPORT_KEY = "9b2cae57f9e54e60b4e5b62b67e7c5d2"
+
+QUICK_INSTALL_DAYS = 30
+
+
+def _classify_stage_bucket(job_status):
+    """
+    Map raw Sunbase job_status text to a coarse pipeline bucket so the funnel
+    visualisation can group hundreds of statuses into a handful of stages.
+    """
+    if not job_status:
+        return ""
+    s = job_status.lower()
+    if s.startswith("cancel"):
+        return "Cancelled"
+    if s.startswith("on hold"):
+        return "On Hold"
+    if "complete" in s or "pto approved" in s:
+        return "Completed"
+    if "pto" in s:
+        return "PTO"
+    if "inspection" in s:
+        return "Inspection"
+    if "install" in s and "ready" in s:
+        return "Ready for Install"
+    if "install" in s:
+        return "Install"
+    if "permit" in s:
+        return "Permitting"
+    if "engineering" in s or "cio" in s:
+        return "Engineering"
+    if "site survey" in s or "ssr" in s:
+        return "Site Survey"
+    if "sold" in s or "crc" in s:
+        return "Sold Projects"
+    return "Sold Projects"
+
+
+def _compute_quick_install(customer_since, install_completed, install_date):
+    end = install_completed or install_date
+    if not customer_since or not end:
+        return False
+    delta = (end - customer_since).days
+    return 0 <= delta <= QUICK_INSTALL_DAYS
 
 NON_CONTACT_STATUSES = {"NH1", "NH2", "NM", "SH"}
 APPOINTMENT_STAGES = {
@@ -322,6 +366,47 @@ def _sync_job_list():
             )
             clean_deal_date = _to_date(row.get("Clean Deal"))
             category = _classify_project(job_status)
+            site_survey_results = _to_date(
+                _get_csv_cell(row, "Site Survey Results", "site survey results", "SSR")
+            )
+            site_survey_submitted = _to_date(
+                _get_csv_cell(row, "Site Survey Submitted", "site survey submitted")
+            )
+            site_survey_approved = _to_date(
+                _get_csv_cell(row, "Site Survey Approved", "site survey approved")
+            )
+            cio_date = _to_date(_get_csv_cell(row, "CIO", "CIO Date", "cio"))
+            engineering_date = _to_date(
+                _get_csv_cell(row, "Engineering", "Engineering Date", "engineering")
+            )
+            permit_submitted = _to_date(
+                _get_csv_cell(row, "Permit Submitted", "permit submitted")
+            )
+            insurance_approved = _to_date(
+                _get_csv_cell(row, "Insurance Approved", "insurance approved")
+            )
+            inspection_scheduled = _to_date(
+                _get_csv_cell(row, "Inspection Scheduled", "inspection scheduled")
+            )
+            inspection_passed = _to_date(
+                _get_csv_cell(row, "Inspection Passed", "inspection passed")
+            )
+            ready_for_pto = _to_date(
+                _get_csv_cell(row, "Ready for PTO", "ready for pto")
+            )
+            pto_approved = _to_date(_get_csv_cell(row, "PTO Approved", "pto approved"))
+            cancelled_date = _to_date(
+                _get_csv_cell(row, "Cancelled Date", "Cancellation Date", "cancelled date")
+            )
+            project_manager = _clean(
+                _get_csv_cell(row, "Project Manager", "project manager", "PM")
+            ) or ""
+            setter = _clean(_get_csv_cell(row, "Setter", "setter")) or ""
+            sunbase_job_uuid = _clean(_get_csv_cell(row, "uuid", "Job UUID", "JobId")) or ""
+            stage_bucket = _classify_stage_bucket(job_status)
+            is_quick_install = _compute_quick_install(
+                customer_since, install_completed, install_date
+            )
             Project.objects.create(
                 first_name=_clean(row.get("First Name")) or "",
                 last_name=_clean(row.get("Last Name")) or "",
@@ -329,16 +414,31 @@ def _sync_job_list():
                 sales_team=_clean(row.get("sales_team")) or "",
                 installer=_clean(row.get("Installer")) or "",
                 lead_source=_clean(row.get("Lead Source")) or "",
+                setter=setter,
+                project_manager=project_manager,
                 job_status=job_status,
                 project_category=category,
+                stage_bucket=stage_bucket,
                 contract_amount=_to_decimal(row.get("Contract Amt")),
                 customer_since=customer_since,
                 install_date=install_date,
                 site_survey_scheduled=site_survey_scheduled,
+                site_survey_submitted=site_survey_submitted,
+                site_survey_approved=site_survey_approved,
+                site_survey_results=site_survey_results,
+                cio_date=cio_date,
+                engineering_date=engineering_date,
                 crc_date=crc_date,
+                permit_submitted=permit_submitted,
                 permit_approved=permit_approved,
+                insurance_approved=insurance_approved,
                 install_completed=install_completed,
+                inspection_scheduled=inspection_scheduled,
+                inspection_passed=inspection_passed,
+                ready_for_pto=ready_for_pto,
                 pto_submitted=pto_submitted,
+                pto_approved=pto_approved,
+                cancelled_date=cancelled_date,
                 cancellation_reason=_first_reason_match(
                     job_status,
                     (
@@ -356,7 +456,9 @@ def _sync_job_list():
                     ),
                 ),
                 is_clean_deal=bool(clean_deal_date),
+                is_quick_install=is_quick_install,
                 is_active=category == "Active",
+                sunbase_job_uuid=sunbase_job_uuid,
             )
             inserted += 1
         except Exception as exc:  # pylint: disable=broad-except
@@ -376,8 +478,10 @@ def _sync_cx_experience():
             pto_submitted = _to_date(row.get("PTO Submitted"))
             pto_approved = _to_date(row.get("PTO Approved"))
             review_captured_date = _to_date(row.get("Review Captured Date"))
+            sunbase_job_uuid = _clean(_get_csv_cell(row, "uuid", "Job UUID", "JobId")) or ""
             CxProject.objects.create(
                 row_number=_to_int(row.get("Row")),
+                sunbase_job_uuid=sunbase_job_uuid,
                 first_name=_clean(row.get("First Name")) or "",
                 last_name=_clean(row.get("Last Name")) or "",
                 job_status=_clean(row.get("Job Status")) or "",
@@ -485,6 +589,41 @@ def _sync_appointments():
     return {"inserted": inserted, "skipped": skipped, "errors": errors}
 
 
+def _sync_users():
+    """
+    Pull the General → Users report into SunbaseUser. Skip silently if the
+    report key isn't configured or the response is empty so the rest of the
+    sync isn't blocked.
+    """
+    inserted = 0
+    errors = []
+    try:
+        rows = _csv_rows(_fetch_report(USERS_REPORT_KEY))
+    except Exception as exc:  # pylint: disable=broad-except
+        return {"inserted": 0, "errors": [f"users report fetch failed: {exc}"]}
+    if not rows:
+        return {"inserted": 0, "errors": []}
+    SunbaseUser.objects.all().delete()
+    for row in rows:
+        try:
+            uuid = _clean(_get_csv_cell(row, "uuid", "User UUID", "User Id")) or ""
+            full_name = _clean(_get_csv_cell(row, "Fullname", "Full Name", "Name")) or ""
+            if not uuid:
+                continue
+            SunbaseUser.objects.create(
+                external_uuid=uuid,
+                full_name=full_name,
+                role=_clean(_get_csv_cell(row, "Role", "User Role")) or "",
+                manager_name=_clean(_get_csv_cell(row, "Manager", "Manager Name")) or "",
+                crew_name=_clean(_get_csv_cell(row, "Crew", "Team", "Crew Name")) or "",
+                login_allowed=(_clean(row.get("Login Allowed")) or "").lower() == "yes",
+            )
+            inserted += 1
+        except Exception as exc:  # pylint: disable=broad-except
+            errors.append(str(exc))
+    return {"inserted": inserted, "errors": errors}
+
+
 def run_full_sync():
     start = time.time()
     timestamp = timezone.now().isoformat()
@@ -495,6 +634,7 @@ def run_full_sync():
         "cxExperience": {"inserted": 0, "errors": []},
         "doorsList": {"inserted": 0, "skipped": 0, "errors": []},
         "appointmentStatus": {"inserted": 0, "skipped": 0, "errors": []},
+        "users": {"inserted": 0, "errors": []},
         "duration": 0,
         "error": "",
     }
@@ -503,11 +643,15 @@ def run_full_sync():
         result["cxExperience"] = _sync_cx_experience()
         result["doorsList"] = _sync_doors()
         result["appointmentStatus"] = _sync_appointments()
+        try:
+            result["users"] = _sync_users()
+        except Exception as exc:  # pylint: disable=broad-except
+            result["users"] = {"inserted": 0, "errors": [str(exc)]}
         result["success"] = True
     except Exception as exc:  # pylint: disable=broad-except
         print("SYNC ERROR:", str(exc))
-        raise  # 🔥 VERY IMPORTANT
         result["error"] = str(exc)
+        raise
     finally:
         result["duration"] = int((time.time() - start) * 1000)
         SyncRun.objects.create(

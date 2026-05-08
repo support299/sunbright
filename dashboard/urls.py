@@ -15,11 +15,14 @@ from dashboard.views.analytics_views import (
     ProjectsCancelledView,
     ProjectsOnHoldView,
     RetentionView,
+    RolePerformanceView,
 )
 from dashboard.views.auth_views import GoogleLoginView, LoginView, RefreshTokenView
 from dashboard.views.dashboard_views import (
     CancellationReasonsView,
     CategoryBreakdownView,
+    FilterOptionsView,
+    MetricsRegistryView,
     OnHoldReasonsView,
     OverviewView,
 )
@@ -41,6 +44,8 @@ urlpatterns = [
         name="dashboard-cancellation-reasons",
     ),
     path("dashboard/on-hold-reasons/", OnHoldReasonsView.as_view(), name="dashboard-on-hold-reasons"),
+    path("dashboard/filter-options/", FilterOptionsView.as_view(), name="dashboard-filter-options"),
+    path("dashboard/metrics-registry/", MetricsRegistryView.as_view(), name="dashboard-metrics-registry"),
     path("clean-deals/", CleanDealsView.as_view(), name="clean-deals"),
     path("retention/", RetentionView.as_view(), name="retention"),
     path("performance/", PerformanceView.as_view(), name="performance"),
@@ -49,6 +54,7 @@ urlpatterns = [
     path("projects/cancelled/", ProjectsCancelledView.as_view(), name="projects-cancelled"),
     path("cx/", CustomerExperienceView.as_view(), name="cx"),
     path("manager/", ManagerPerformanceView.as_view(), name="manager"),
+    path("role-performance/", RolePerformanceView.as_view(), name="role-performance"),
     path("insights/generate/", InsightsGenerateView.as_view(), name="insights-generate"),
     path("insights/chat/", InsightsChatView.as_view(), name="insights-chat"),
     path("insights/conversations/", InsightsConversationListView.as_view(), name="insights-conversations"),

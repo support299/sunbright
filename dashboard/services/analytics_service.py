@@ -3,6 +3,8 @@ Aggregations for dashboard API responses (mirrors sunbright-dashboard/db.ts logi
 Uses fields present on synced Django models.
 """
 from collections import defaultdict
+from functools import reduce
+from operator import or_
 
 from django.db.models import (
     Avg,
@@ -14,10 +16,16 @@ from django.db.models import (
     Sum,
     Value,
 )
-from django.db.models.functions import Coalesce
+from django.db.models.functions import Coalesce, Lower
 from django.utils import timezone
 
-from dashboard.models import Appointment, CxProject, Door
+from dashboard.models import (
+    Appointment,
+    CxProject,
+    DashboardDataScope,
+    Door,
+    SunbaseUser,
+)
 from dashboard.scope import appointment_scope_q, cx_scope_q, door_scope_q
 from dashboard.services.project_service import base_queryset
 
@@ -456,9 +464,27 @@ def get_performance_bundle(date_from=None, date_to=None, user=None):
     return {"reps": rep_list, "teams": team_list, "installers": inst_list}
 
 
+_PIPELINE_FUNNEL_ORDER = (
+    "Sold Projects",
+    "Site Survey",
+    "Engineering",
+    "Permitting",
+    "Ready for Install",
+    "Install",
+    "Inspection",
+    "PTO",
+    "Completed",
+    "Cancelled",
+    "On Hold",
+)
+
+
 def get_pipeline_bundle(date_from=None, date_to=None, user=None):
     """
-    Mirrors sunbright-dashboard getPipelineVelocity + getPipelineVelocityAvg using Project milestone dates.
+    Pipeline visualisation bundle.
+
+    Returns velocity rows (one per project) + canonical funnel buckets,
+    CRC analytics, deals-pipeline counters, and the quick-install rollup.
     """
     qs = base_queryset(date_from, date_to, user)
     today = timezone.now().date()
@@ -469,28 +495,38 @@ def get_pipeline_bundle(date_from=None, date_to=None, user=None):
         "sales_rep",
         "sales_team",
         "installer",
+        "project_manager",
         "project_category",
+        "stage_bucket",
         "is_clean_deal",
+        "is_quick_install",
         "job_status",
         "customer_since",
         "install_date",
         "site_survey_scheduled",
+        "site_survey_results",
+        "site_survey_submitted",
+        "site_survey_approved",
         "crc_date",
         "permit_approved",
         "install_completed",
         "pto_submitted",
+        "pto_approved",
     )
     rows = list(qs.order_by("customer_since").values(*fields)[:5000])
 
     crc_l, ss_crc_l, permit_l, crc_inst_l = [], [], [], []
     sign_inst_l, inst_pto_l, sign_pto_l = [], [], []
     clean_inst_l, notclean_inst_l = [], []
+    cust_ss_l, ss_ssr_l, ssr_crc_l = [], [], []
+    quick_install_rows = []
 
     velocity = []
     for r in rows:
         cs = r["customer_since"]
         crc = r["crc_date"]
         ss = r["site_survey_scheduled"]
+        ssr = r["site_survey_results"]
         permit = r["permit_approved"]
         inst_d = r["install_date"]
         inst_c = r["install_completed"]
@@ -522,34 +558,58 @@ def get_pipeline_bundle(date_from=None, date_to=None, user=None):
         d_sign_pto = _days_span(cs, pto)
         if d_sign_pto is not None:
             sign_pto_l.append(d_sign_pto)
+        d_cust_ss = _days_span(cs, ss)
+        if d_cust_ss is not None:
+            cust_ss_l.append(d_cust_ss)
+        d_ss_ssr = _days_span(ss, ssr)
+        if d_ss_ssr is not None:
+            ss_ssr_l.append(d_ss_ssr)
+        d_ssr_crc = _days_span(ssr, crc)
+        if d_ssr_crc is not None:
+            ssr_crc_l.append(d_ssr_crc)
 
         project_age = (today - cs).days if cs else None
-        velocity.append(
-            {
-                "id": r["id"],
-                "firstName": (r["first_name"] or "").strip() or None,
-                "lastName": (r["last_name"] or "").strip() or None,
-                "salesRep": r["sales_rep"],
-                "salesTeam": r["sales_team"],
-                "installer": r["installer"],
-                "projectCategory": r["project_category"],
-                "isCleanDeal": 1 if r["is_clean_deal"] else 0,
-                "jobStatus": r["job_status"],
-                "customerSince": cs.isoformat() if cs else None,
-                "daysToCrc": d_crc,
-                "daysSsToCrc": d_ss_crc,
-                "daysToPermit": d_perm,
-                "daysToInstall": d_sign_inst,
-                "daysCrcToInstall": d_crc_inst,
-                "daysInstallToPto": d_inst_pto,
-                "daysToPtoSubmitted": d_sign_pto,
-                "projectAgeDays": project_age,
-            }
-        )
+        velocity_row = {
+            "id": r["id"],
+            "firstName": (r["first_name"] or "").strip() or None,
+            "lastName": (r["last_name"] or "").strip() or None,
+            "salesRep": r["sales_rep"],
+            "salesTeam": r["sales_team"],
+            "installer": r["installer"],
+            "projectManager": r["project_manager"] or "",
+            "projectCategory": r["project_category"],
+            "stageBucket": r["stage_bucket"] or "",
+            "isCleanDeal": 1 if r["is_clean_deal"] else 0,
+            "isQuickInstall": 1 if r["is_quick_install"] else 0,
+            "jobStatus": r["job_status"],
+            "customerSince": cs.isoformat() if cs else None,
+            "daysToCrc": d_crc,
+            "daysSsToCrc": d_ss_crc,
+            "daysCustomerToSs": d_cust_ss,
+            "daysSsToSsr": d_ss_ssr,
+            "daysSsrToCrc": d_ssr_crc,
+            "daysToPermit": d_perm,
+            "daysToInstall": d_sign_inst,
+            "daysCrcToInstall": d_crc_inst,
+            "daysInstallToPto": d_inst_pto,
+            "daysToPtoSubmitted": d_sign_pto,
+            "projectAgeDays": project_age,
+        }
+        velocity.append(velocity_row)
+        if r["is_quick_install"] and d_sign_inst is not None:
+            quick_install_rows.append(
+                {
+                    **velocity_row,
+                    "installDate": (inst_done.isoformat() if inst_done else None),
+                }
+            )
 
     averages = {
         "avgDaysToCrc": _mean_rounded(crc_l),
         "avgDaysSsToCrc": _mean_rounded(ss_crc_l),
+        "avgDaysCustomerToSs": _mean_rounded(cust_ss_l),
+        "avgDaysSsToSsr": _mean_rounded(ss_ssr_l),
+        "avgDaysSsrToCrc": _mean_rounded(ssr_crc_l),
         "avgDaysToPermit": _mean_rounded(permit_l),
         "avgDaysCrcToInstall": _mean_rounded(crc_inst_l),
         "avgDaysToInstall": _mean_rounded(sign_inst_l),
@@ -558,13 +618,145 @@ def get_pipeline_bundle(date_from=None, date_to=None, user=None):
         "avgInstallClean": _mean_rounded(clean_inst_l),
         "avgInstallNotClean": _mean_rounded(notclean_inst_l),
     }
-    return {"velocity": velocity, "averages": averages}
+
+    funnel = _build_pipeline_funnel(qs)
+    crc_analytics = _build_crc_analytics(averages, crc_l)
+    deals_pipeline = _build_deals_pipeline(qs)
+    quick_installs = _build_quick_installs(qs, quick_install_rows)
+
+    return {
+        "velocity": velocity,
+        "averages": averages,
+        "funnel": funnel,
+        "crcAnalytics": crc_analytics,
+        "dealsPipeline": deals_pipeline,
+        "quickInstalls": quick_installs,
+    }
 
 
-def get_cx_bundle(date_from=None, date_to=None, user=None):
+def _build_pipeline_funnel(qs):
+    """
+    Stage-bucket counts in canonical funnel order. Each step also reports
+    `pctOfPrev` (conversion vs the previous step) so the UI can render a
+    proper funnel without duplicating logic.
+    """
+    raw = dict(
+        qs.exclude(stage_bucket="")
+        .values_list("stage_bucket")
+        .annotate(c=Count("id"))
+    )
+    out = []
+    prev = None
+    for stage in _PIPELINE_FUNNEL_ORDER:
+        count = int(raw.get(stage) or raw.get((stage,), 0) or 0)
+        if not count:
+            for k, v in raw.items():
+                if isinstance(k, (tuple, list)) and k and k[0] == stage:
+                    count = int(v)
+                    break
+        out.append(
+            {
+                "stage": stage,
+                "count": count,
+                "pctOfPrev": _pct(count, prev) if prev else None,
+            }
+        )
+        prev = count
+    return out
+
+
+def _build_crc_analytics(averages, crc_l):
+    series = [
+        {"label": "Customer → SS", "days": averages.get("avgDaysCustomerToSs"), "n": None},
+        {"label": "SS → SSR", "days": averages.get("avgDaysSsToSsr"), "n": None},
+        {"label": "SSR → CRC", "days": averages.get("avgDaysSsrToCrc"), "n": None},
+        {"label": "Customer → CRC", "days": averages.get("avgDaysToCrc"), "n": len(crc_l)},
+    ]
+    return {
+        "kpis": {
+            "avgDaysCustomerToSs": averages.get("avgDaysCustomerToSs"),
+            "avgDaysSsToSsr": averages.get("avgDaysSsToSsr"),
+            "avgDaysSsrToCrc": averages.get("avgDaysSsrToCrc"),
+            "avgDaysToCrc": averages.get("avgDaysToCrc"),
+        },
+        "series": series,
+    }
+
+
+def _build_deals_pipeline(qs):
+    """
+    Ordered list of milestone counters used by the 'Deals Pipeline' bar chart.
+    The first row ('Sold Projects') is treated by the UI as the denominator
+    when computing per-stage percentages.
+    """
+    stages = [
+        ("Sold Projects", qs.exclude(customer_since__isnull=True).count()),
+        ("Site Survey", qs.exclude(site_survey_scheduled__isnull=True).count()),
+        ("Site Survey Results", qs.exclude(site_survey_results__isnull=True).count()),
+        ("CRC", qs.exclude(crc_date__isnull=True).count()),
+        ("Permit Approved", qs.exclude(permit_approved__isnull=True).count()),
+        ("Install Scheduled", qs.exclude(install_date__isnull=True).count()),
+        ("Install Completed", qs.exclude(install_completed__isnull=True).count()),
+        ("PTO Submitted", qs.exclude(pto_submitted__isnull=True).count()),
+        ("PTO Approved", qs.exclude(pto_approved__isnull=True).count()),
+    ]
+    return [{"label": label, "count": int(count)} for label, count in stages]
+
+
+def _build_quick_installs(qs, quick_install_rows):
+    total_installed = qs.exclude(install_date__isnull=True).count()
+    quick_count = qs.filter(is_quick_install=True).count()
+    return {
+        "count": quick_count,
+        "totalInstalled": total_installed,
+        "quickInstallRate": _pct(quick_count, total_installed),
+        "items": quick_install_rows[:200],
+    }
+
+
+def get_cx_bundle(
+    date_from=None,
+    date_to=None,
+    user=None,
+    *,
+    installer=None,
+    sales_team=None,
+    lead_source=None,
+    project_manager=None,
+):
     cx = _cx_qs(date_from, date_to, user)
+
+    inst_clean = (installer or "").strip() if installer else ""
+    if inst_clean:
+        cx = cx.filter(installer__iexact=inst_clean)
+
+    extra_dims = any(
+        v and str(v).strip() for v in (sales_team, lead_source, project_manager)
+    )
+    if extra_dims:
+        proj_qs = base_queryset(
+            date_from,
+            date_to,
+            user,
+            installer=installer,
+            sales_team=sales_team,
+            lead_source=lead_source,
+            project_manager=project_manager,
+        )
+        uuid_set = list(
+            proj_qs.exclude(sunbase_job_uuid="")
+            .values_list("sunbase_job_uuid", flat=True)
+            .distinct()
+        )
+        cx = cx.filter(sunbase_job_uuid__in=uuid_set) if uuid_set else cx.none()
+
     total = cx.count()
     reviews = cx.filter(has_review=True).count()
+    inspection_passed = cx.filter(inspection_passed__isnull=False).count()
+    pto_submitted = cx.filter(pto_submitted__isnull=False).count()
+    pto_approved = cx.filter(pto_approved__isnull=False).count()
+    inspection_scheduled = cx.filter(inspection_scheduled__isnull=False).count()
+    goal_reviews = (total + 1) // 2 if total else 0
     overview = {
         "totalInstalls": total,
         "reviewsCaptured": reviews,
@@ -577,10 +769,18 @@ def get_cx_bundle(date_from=None, date_to=None, user=None):
         "avgInstallToPtoApproved": _round_avg(cx.aggregate(v=Avg("days_install_to_pto_approved"))["v"]),
         "avgInstallToReview": _round_avg(cx.aggregate(v=Avg("days_install_to_review"))["v"]),
         "avgInspectionScheduledToPassed": _round_avg(cx.aggregate(v=Avg("days_inspection_scheduled_to_passed"))["v"]),
-        "inspectionPassedCount": cx.filter(inspection_passed__isnull=False).count(),
-        "ptoSubmittedCount": cx.filter(pto_submitted__isnull=False).count(),
-        "ptoApprovedCount": cx.filter(pto_approved__isnull=False).count(),
-        "inspectionScheduledCount": cx.filter(inspection_scheduled__isnull=False).count(),
+        "inspectionPassedCount": inspection_passed,
+        "ptoSubmittedCount": pto_submitted,
+        "ptoApprovedCount": pto_approved,
+        "inspectionScheduledCount": inspection_scheduled,
+        "goalReviews": goal_reviews,
+        "reviewGap": max(0, goal_reviews - reviews),
+        "inspectionPassedPct": _pct(inspection_passed, total) if total else 0.0,
+        "ptoSubmittedPct": _pct(pto_submitted, total) if total else 0.0,
+        "ptoApprovedPct": _pct(pto_approved, total) if total else 0.0,
+        "installsWithoutInspection": max(0, total - inspection_passed),
+        "installsWithoutPto": max(0, total - pto_approved),
+        "installsWithoutReview": max(0, total - reviews),
     }
 
     by_installer = []
@@ -773,8 +973,213 @@ def _manager_overview_counts(appts, doors):
     }
 
 
-def get_manager_bundle(date_from=None, date_to=None, user=None):
+def _month_key(d):
+    return f"{d.year:04d}-{d.month:02d}" if d else None
+
+
+def _fill_monthly_series(date_from, date_to, mapping):
+    """Return [{month, value}] in chronological order, padding zeros across the range."""
+    if not mapping and not (date_from and date_to):
+        return []
+    keys = set(mapping.keys())
+    if date_from and date_to:
+        y, m = date_from.year, date_from.month
+        end_y, end_m = date_to.year, date_to.month
+        cursor = []
+        while (y, m) <= (end_y, end_m):
+            cursor.append(f"{y:04d}-{m:02d}")
+            m += 1
+            if m == 13:
+                m = 1
+                y += 1
+        ordered = cursor
+    else:
+        ordered = sorted(keys)
+    return [{"month": k, "value": int(mapping.get(k, 0))} for k in ordered]
+
+
+def _get_pm_performance_bundle(pq, date_from=None, date_to=None):
+    """
+    Aggregate operational KPIs by Sunbase Project Manager (job-level Project rows).
+
+    Returns a tuple (rows, kpis) where:
+      rows  — per-PM dicts including monthly install / clean-deal series
+      kpis  — overall aggregate KPIs across the filtered project queryset
+    """
+    rows = list(
+        pq.exclude(project_manager="").values(
+            "project_manager",
+            "project_category",
+            "is_clean_deal",
+            "customer_since",
+            "crc_date",
+            "site_survey_scheduled",
+            "site_survey_results",
+            "install_date",
+            "install_completed",
+        )
+    )
+
+    buckets = defaultdict(
+        lambda: {
+            "totalProjects": 0,
+            "activeProjects": 0,
+            "cancelledProjects": 0,
+            "onHoldProjects": 0,
+            "redFlaggedProjects": 0,
+            "disqualifiedProjects": 0,
+            "cleanDeals": 0,
+            "crcReached": 0,
+            "installScheduled": 0,
+            "installCompleted": 0,
+            "crc_days": [],
+            "ss_ssr_days": [],
+            "install_days": [],
+            "installs_by_month": defaultdict(int),
+            "clean_deals_by_month": defaultdict(int),
+        }
+    )
+
+    totals = {
+        "totalProjects": 0,
+        "activeProjects": 0,
+        "cancelledProjects": 0,
+        "onHoldProjects": 0,
+        "redFlaggedProjects": 0,
+        "disqualifiedProjects": 0,
+        "cleanDeals": 0,
+        "installScheduled": 0,
+        "installCompleted": 0,
+        "crcReached": 0,
+    }
+
+    for r in rows:
+        pm = (r.get("project_manager") or "").strip()
+        if not pm:
+            continue
+        b = buckets[pm]
+        b["totalProjects"] += 1
+        totals["totalProjects"] += 1
+        cat = r.get("project_category") or ""
+        if cat == "Active":
+            b["activeProjects"] += 1
+            totals["activeProjects"] += 1
+        elif cat == "Cancelled":
+            b["cancelledProjects"] += 1
+            totals["cancelledProjects"] += 1
+        elif cat == "On Hold":
+            b["onHoldProjects"] += 1
+            totals["onHoldProjects"] += 1
+        elif cat == "Red Flagged":
+            b["redFlaggedProjects"] += 1
+            totals["redFlaggedProjects"] += 1
+        elif cat == "Disqualified":
+            b["disqualifiedProjects"] += 1
+            totals["disqualifiedProjects"] += 1
+        if r.get("is_clean_deal"):
+            b["cleanDeals"] += 1
+            totals["cleanDeals"] += 1
+
+        cs = r.get("customer_since")
+        crc = r.get("crc_date")
+        if crc:
+            b["crcReached"] += 1
+            totals["crcReached"] += 1
+        if cs and crc and crc >= cs:
+            b["crc_days"].append((crc - cs).days)
+
+        ss = r.get("site_survey_scheduled")
+        ssr = r.get("site_survey_results")
+        if ss and ssr and ssr >= ss:
+            b["ss_ssr_days"].append((ssr - ss).days)
+
+        ins = r.get("install_date")
+        ins_done = r.get("install_completed")
+        if ins:
+            b["installScheduled"] += 1
+            totals["installScheduled"] += 1
+        if ins_done:
+            b["installCompleted"] += 1
+            totals["installCompleted"] += 1
+        if cs and ins and ins >= cs:
+            b["install_days"].append((ins - cs).days)
+
+        install_month_src = ins_done or ins
+        if install_month_src:
+            mk = _month_key(install_month_src)
+            if mk:
+                b["installs_by_month"][mk] += 1
+        if r.get("is_clean_deal") and cs:
+            mk = _month_key(cs)
+            if mk:
+                b["clean_deals_by_month"][mk] += 1
+
+    out = []
+    for pm, b in buckets.items():
+        t = b["totalProjects"]
+        bad = b["cancelledProjects"] + b["onHoldProjects"] + b["redFlaggedProjects"]
+        out.append(
+            {
+                "projectManager": pm,
+                "totalProjects": t,
+                "activeProjects": b["activeProjects"],
+                "cancelledProjects": b["cancelledProjects"],
+                "onHoldProjects": b["onHoldProjects"],
+                "redFlaggedProjects": b["redFlaggedProjects"],
+                "disqualifiedProjects": b["disqualifiedProjects"],
+                "cleanDeals": b["cleanDeals"],
+                "cleanDealPct": _pct(b["cleanDeals"], t),
+                "cancellationRate": _pct(b["cancelledProjects"], t),
+                "netRetentionRate": _pct(t - bad, t) if t else 0.0,
+                "crcReachedCount": b["crcReached"],
+                "installScheduledCount": b["installScheduled"],
+                "installCompletedCount": b["installCompleted"],
+                "avgDaysToCrc": _mean_rounded(b["crc_days"]),
+                "avgDaysSsToSsr": _mean_rounded(b["ss_ssr_days"]),
+                "avgDaysToInstall": _mean_rounded(b["install_days"]),
+                "monthlyInstalls": _fill_monthly_series(date_from, date_to, b["installs_by_month"]),
+                "monthlyCleanDeals": _fill_monthly_series(date_from, date_to, b["clean_deals_by_month"]),
+            }
+        )
+
+    out.sort(key=lambda x: -x["totalProjects"])
+    out = out[:200]
+
+    t = totals["totalProjects"]
+    kpis = {
+        "totalProjects": t,
+        "activeDeals": totals["activeProjects"],
+        "cancelled": totals["cancelledProjects"],
+        "cancelledPct": _pct(totals["cancelledProjects"], t),
+        "onHold": totals["onHoldProjects"],
+        "onHoldPct": _pct(totals["onHoldProjects"], t),
+        "redFlagged": totals["redFlaggedProjects"],
+        "redFlaggedPct": _pct(totals["redFlaggedProjects"], t),
+        "cleanDeals": totals["cleanDeals"],
+        "cleanDealsPct": _pct(totals["cleanDeals"], t),
+        "installScheduled": totals["installScheduled"],
+        "installScheduledPct": _pct(totals["installScheduled"], t),
+        "installCompleted": totals["installCompleted"],
+        "installCompletedPct": _pct(totals["installCompleted"], t),
+        "crcReached": totals["crcReached"],
+        "crcReachedPct": _pct(totals["crcReached"], t),
+    }
+    return out, kpis
+
+
+def get_manager_bundle(
+    date_from=None,
+    date_to=None,
+    user=None,
+    *,
+    installer=None,
+    sales_team=None,
+    lead_source=None,
+    project_manager=None,
+):
     appts = _appt_qs(date_from, date_to, user)
+    if sales_team and str(sales_team).strip():
+        appts = appts.filter(sales_team__iexact=str(sales_team).strip())
     doors = _door_qs(date_from, date_to, user)
 
     rep_rows = (
@@ -901,7 +1306,15 @@ def get_manager_bundle(date_from=None, date_to=None, user=None):
             }
         )
 
-    pq = base_queryset(date_from, date_to, user)
+    pq = base_queryset(
+        date_from,
+        date_to,
+        user,
+        installer=installer,
+        sales_team=sales_team,
+        lead_source=lead_source,
+        project_manager=project_manager,
+    )
     overview = {
         "totalProjects": pq.count(),
         "activeProjects": pq.filter(project_category="Active").count(),
@@ -909,6 +1322,7 @@ def get_manager_bundle(date_from=None, date_to=None, user=None):
     }
 
     manager_overview = _manager_overview_counts(appts, doors)
+    pm_performance, pm_kpis = _get_pm_performance_bundle(pq, date_from, date_to)
 
     return {
         "overview": overview,
@@ -918,4 +1332,433 @@ def get_manager_bundle(date_from=None, date_to=None, user=None):
         "doorStats": door_stats,
         "dealStageBreakdown": deal_stage_breakdown,
         "pendingOutcome": pending,
+        "pmPerformance": pm_performance,
+        "pmKpis": pm_kpis,
+    }
+
+
+def _scoped_sunbase_users(user):
+    """Sunbase directory rows visible under the same dashboard data scope as facts."""
+    qs = SunbaseUser.objects.all()
+    if user is None or getattr(user, "is_staff", False) or not getattr(user, "is_authenticated", False):
+        return qs
+    try:
+        ds = user.dashboard_scope
+    except DashboardDataScope.DoesNotExist:
+        return SunbaseUser.objects.none()
+
+    kind = ds.scope_kind
+    if kind == DashboardDataScope.ScopeKind.TEAM:
+        if not (ds.sales_team or "").strip():
+            return SunbaseUser.objects.none()
+        t = ds.sales_team.strip()
+        return qs.filter(Q(crew_name__iexact=t) | Q(team__name__iexact=t))
+
+    if kind == DashboardDataScope.ScopeKind.TEAMS:
+        names = [n.strip() for n in (ds.sales_teams or []) if isinstance(n, str) and n.strip()]
+        if not names:
+            return SunbaseUser.objects.none()
+        team_q = reduce(or_, (Q(crew_name__iexact=n) | Q(team__name__iexact=n) for n in names))
+        return qs.filter(team_q)
+
+    if kind == DashboardDataScope.ScopeKind.REP:
+        if not (ds.sales_rep or "").strip():
+            return SunbaseUser.objects.none()
+        return qs.filter(full_name__iexact=ds.sales_rep.strip())
+
+    return SunbaseUser.objects.none()
+
+
+def _total_numeric_rows(rows, keys):
+    out = {k: 0 for k in keys}
+    for r in rows:
+        for k in keys:
+            out[k] += int(r.get(k) or 0)
+    return out
+
+
+def _name_key(name):
+    return (name or "").strip().lower()
+
+
+def get_role_performance_bundle(
+    date_from=None,
+    date_to=None,
+    user=None,
+    *,
+    installer=None,
+    sales_team=None,
+    lead_source=None,
+    project_manager=None,
+):
+    """
+    Role-based agent tables aligned with Sunbase Users (role, crew).
+    - Setters: Sunbase role contains "setter"; activity matched on Door.canvasser, Appointment.setter, Project.setter.
+    - Closers: Sunbase role is Sales or contains "closer"; activity on Appointment.sales_rep (self vs assigned split).
+    Name matching is case-insensitive exact on full name strings (aggregated with Lower() for performance).
+
+    Optional dimension filters mirror the Manager Performance / Pipeline endpoints
+    so the global filter bar can narrow these tables consistently.
+    """
+    doors = _door_qs(date_from, date_to, user)
+    appts = _appt_qs(date_from, date_to, user)
+    projects = base_queryset(
+        date_from,
+        date_to,
+        user,
+        installer=installer,
+        sales_team=sales_team,
+        lead_source=lead_source,
+        project_manager=project_manager,
+    )
+
+    sales_team_clean = (sales_team or "").strip() if sales_team else ""
+    if sales_team_clean:
+        appts = appts.filter(sales_team__iexact=sales_team_clean)
+    lead_source_clean = (lead_source or "").strip() if lead_source else ""
+    if lead_source_clean:
+        appts = appts.filter(lead_source__iexact=lead_source_clean)
+
+    appt_doorish_q = (
+        Q(lead_source__icontains="door")
+        | Q(lead_source__icontains="d2d")
+        | Q(lead_source__icontains="canvass")
+        | Q(lead_source__icontains="field")
+    )
+
+    door_by_name = {}
+    for row in (
+        doors.exclude(canvasser="")
+        .annotate(_lk=Lower("canvasser"))
+        .values("_lk")
+        .annotate(all_doors=Count("id"), contacts_made=Count("id", filter=Q(is_contact=True)))
+    ):
+        door_by_name[row["_lk"]] = row
+
+    appt_by_setter = {}
+    for row in (
+        appts.exclude(setter="")
+        .annotate(_lk=Lower("setter"))
+        .values("_lk")
+        .annotate(
+            appointments=Count("id"),
+            appointment_doors_heuristic=Count("id", filter=appt_doorish_q),
+            sitdowns=Count("id", filter=Q(stage_category__in=_SHOW_STAGES)),
+            qfd_sits=Count("id", filter=Q(stage_category__in=("qualified_show", "closed"))),
+        )
+    ):
+        appt_by_setter[row["_lk"]] = row
+
+    proj_by_setter = {}
+    for row in (
+        projects.exclude(setter="")
+        .annotate(_lk=Lower("setter"))
+        .values("_lk")
+        .annotate(
+            all_jobs=Count("id"),
+            jobs_cancelled=Count("id", filter=Q(project_category="Cancelled")),
+            active_deals=Count("id", filter=Q(project_category="Active")),
+            jobs_on_hold=Count("id", filter=Q(project_category="On Hold")),
+            jobs_red_flagged=Count("id", filter=Q(project_category="Red Flagged")),
+            clean_deals=Count("id", filter=Q(is_clean_deal=True)),
+            total_install=Count(
+                "id",
+                filter=Q(install_date__isnull=False) | Q(install_completed__isnull=False),
+            ),
+        )
+    ):
+        proj_by_setter[row["_lk"]] = row
+
+    proj_by_rep = {}
+    for row in (
+        projects.exclude(sales_rep="")
+        .annotate(_lk=Lower("sales_rep"))
+        .values("_lk")
+        .annotate(
+            all_jobs=Count("id"),
+            jobs_cancelled=Count("id", filter=Q(project_category="Cancelled")),
+            active_deals=Count("id", filter=Q(project_category="Active")),
+            jobs_on_hold=Count("id", filter=Q(project_category="On Hold")),
+            jobs_red_flagged=Count("id", filter=Q(project_category="Red Flagged")),
+            clean_deals=Count("id", filter=Q(is_clean_deal=True)),
+            total_install=Count(
+                "id",
+                filter=Q(install_date__isnull=False) | Q(install_completed__isnull=False),
+            ),
+        )
+    ):
+        proj_by_rep[row["_lk"]] = row
+
+    appt_by_rep = {}
+    for row in (
+        appts.exclude(sales_rep="")
+        .annotate(_lk=Lower("sales_rep"))
+        .values("_lk")
+        .annotate(
+            appointments_self_gen=Count("id", filter=Q(is_self_set=True)),
+            appointments_lead_gen=Count("id", filter=Q(is_self_set=False)),
+            total_appointments=Count("id"),
+            sits_self_gen=Count("id", filter=Q(is_self_set=True, stage_category__in=_SHOW_STAGES)),
+            sits_lead_gen=Count("id", filter=Q(is_self_set=False, stage_category__in=_SHOW_STAGES)),
+            total_sits=Count("id", filter=Q(stage_category__in=_SHOW_STAGES)),
+            qfd_self=Count("id", filter=Q(is_self_set=True, stage_category__in=("qualified_show", "closed"))),
+            qfd_lead=Count("id", filter=Q(is_self_set=False, stage_category__in=("qualified_show", "closed"))),
+            total_qfd=Count("id", filter=Q(stage_category__in=("qualified_show", "closed"))),
+            deals_self=Count("id", filter=Q(is_self_set=True, stage_category="closed")),
+            deals_lead=Count("id", filter=Q(is_self_set=False, stage_category="closed")),
+        )
+    ):
+        appt_by_rep[row["_lk"]] = row
+
+    sunbase_qs = _scoped_sunbase_users(user).exclude(full_name="").exclude(role__iexact="admin")
+
+    setter_users = sunbase_qs.filter(role__icontains="setter")
+    setter_rows = []
+    for su in setter_users.order_by("full_name")[:400]:
+        name = (su.full_name or "").strip()
+        if not name:
+            continue
+        lk = _name_key(name)
+        dd = door_by_name.get(lk) or {}
+        ad = appt_by_setter.get(lk) or {}
+        pd = proj_by_setter.get(lk) or {}
+
+        all_doors = int(dd.get("all_doors") or 0)
+        contacts_made = int(dd.get("contacts_made") or 0)
+        appointments = int(ad.get("appointments") or 0)
+        appts_doors_heuristic = int(ad.get("appointment_doors_heuristic") or 0)
+        sitdowns = int(ad.get("sitdowns") or 0)
+        qfd_sits = int(ad.get("qfd_sits") or 0)
+        all_jobs = int(pd.get("all_jobs") or 0)
+        jobs_cancelled = int(pd.get("jobs_cancelled") or 0)
+        active_deals = int(pd.get("active_deals") or 0)
+        jobs_on_hold = int(pd.get("jobs_on_hold") or 0)
+        jobs_red_flagged = int(pd.get("jobs_red_flagged") or 0)
+        clean_deals = int(pd.get("clean_deals") or 0)
+        total_install = int(pd.get("total_install") or 0)
+
+        contact_rate = _pct(contacts_made, all_doors)
+        appt_sched_ratio = _pct(appointments, contacts_made) if contacts_made else _pct(appointments, all_doors)
+        sit_down_rate = _pct(sitdowns, appointments) if appointments else 0.0
+        clean_pct = _pct(clean_deals, all_jobs) if all_jobs else 0.0
+        cancel_pct = _pct(jobs_cancelled, all_jobs) if all_jobs else 0.0
+        retention_pct = (
+            _pct(all_jobs - (jobs_cancelled + jobs_on_hold + jobs_red_flagged), all_jobs)
+            if all_jobs
+            else 0.0
+        )
+
+        setter_rows.append(
+            {
+                "agent": name,
+                "role": su.role or "",
+                "crew": su.crew_name or "",
+                "allDoors": all_doors,
+                "contactsMade": contacts_made,
+                "appointmentDoorsHeuristic": appts_doors_heuristic,
+                "appointments": appointments,
+                "sitdowns": sitdowns,
+                "qfdSitdowns": qfd_sits,
+                "allJobs": all_jobs,
+                "jobsCancelled": jobs_cancelled,
+                "activeDeals": active_deals,
+                "jobsOnHold": jobs_on_hold,
+                "jobsRedFlagged": jobs_red_flagged,
+                "cleanDeals": clean_deals,
+                "totalInstall": total_install,
+                "contactRate": contact_rate,
+                "apptSchedRatio": appt_sched_ratio,
+                "sitDownRate": sit_down_rate,
+                "cleanPct": clean_pct,
+                "cancellationRate": cancel_pct,
+                "netRetentionRate": retention_pct,
+            }
+        )
+
+    closer_users = sunbase_qs.filter(Q(role__iexact="Sales") | Q(role__icontains="closer")).exclude(
+        role__icontains="setter"
+    )
+    closer_rows = []
+    for su in closer_users.order_by("full_name")[:400]:
+        name = (su.full_name or "").strip()
+        if not name:
+            continue
+        lk = _name_key(name)
+        dd = door_by_name.get(lk) or {}
+        rd = appt_by_rep.get(lk) or {}
+        pr = proj_by_rep.get(lk) or {}
+
+        all_doors = int(dd.get("all_doors") or 0)
+        contacts_made = int(dd.get("contacts_made") or 0)
+        appts_self = int(rd.get("appointments_self_gen") or 0)
+        appts_lead = int(rd.get("appointments_lead_gen") or 0)
+        total_appts = int(rd.get("total_appointments") or 0)
+        sits_self = int(rd.get("sits_self_gen") or 0)
+        sits_lead = int(rd.get("sits_lead_gen") or 0)
+        total_sits = int(rd.get("total_sits") or 0)
+        qfd_self = int(rd.get("qfd_self") or 0)
+        qfd_lead = int(rd.get("qfd_lead") or 0)
+        total_qfd = int(rd.get("total_qfd") or 0)
+        deals_self = int(rd.get("deals_self") or 0)
+        deals_lead = int(rd.get("deals_lead") or 0)
+        total_deals = deals_self + deals_lead
+
+        all_jobs = int(pr.get("all_jobs") or 0)
+        jobs_cancelled = int(pr.get("jobs_cancelled") or 0)
+        active_deals = int(pr.get("active_deals") or 0)
+        jobs_on_hold = int(pr.get("jobs_on_hold") or 0)
+        jobs_red_flagged = int(pr.get("jobs_red_flagged") or 0)
+        clean_deals = int(pr.get("clean_deals") or 0)
+        total_install = int(pr.get("total_install") or 0)
+
+        sit_down_rate = _pct(total_sits, total_appts) if total_appts else 0.0
+        closing_rate = _pct(total_deals, total_sits) if total_sits else 0.0
+        clean_pct = _pct(clean_deals, all_jobs) if all_jobs else 0.0
+        cancel_pct = _pct(jobs_cancelled, all_jobs) if all_jobs else 0.0
+        retention_pct = (
+            _pct(all_jobs - (jobs_cancelled + jobs_on_hold + jobs_red_flagged), all_jobs)
+            if all_jobs
+            else 0.0
+        )
+
+        closer_rows.append(
+            {
+                "agent": name,
+                "role": su.role or "",
+                "crew": su.crew_name or "",
+                "allDoors": all_doors,
+                "contactsMade": contacts_made,
+                "appointmentsSelfGen": appts_self,
+                "appointmentsLeadGen": appts_lead,
+                "totalAppointments": total_appts,
+                "sitsSelfGen": sits_self,
+                "sitsLeadGen": sits_lead,
+                "totalSits": total_sits,
+                "qfdSitsSelfGen": qfd_self,
+                "qfdSitsLeadGen": qfd_lead,
+                "totalQfdSits": total_qfd,
+                "dealsSelfGen": deals_self,
+                "dealsLeadGen": deals_lead,
+                "totalDeals": total_deals,
+                "allJobs": all_jobs,
+                "jobsCancelled": jobs_cancelled,
+                "activeDeals": active_deals,
+                "jobsOnHold": jobs_on_hold,
+                "jobsRedFlagged": jobs_red_flagged,
+                "cleanDeals": clean_deals,
+                "totalInstall": total_install,
+                "sitDownRate": sit_down_rate,
+                "closingRate": closing_rate,
+                "cleanPct": clean_pct,
+                "cancellationRate": cancel_pct,
+                "netRetentionRate": retention_pct,
+            }
+        )
+
+    setter_num_keys = [
+        "allDoors",
+        "contactsMade",
+        "appointmentDoorsHeuristic",
+        "appointments",
+        "sitdowns",
+        "qfdSitdowns",
+        "allJobs",
+        "jobsCancelled",
+        "activeDeals",
+        "jobsOnHold",
+        "jobsRedFlagged",
+        "cleanDeals",
+        "totalInstall",
+    ]
+    closer_num_keys = [
+        "allDoors",
+        "contactsMade",
+        "appointmentsSelfGen",
+        "appointmentsLeadGen",
+        "totalAppointments",
+        "sitsSelfGen",
+        "sitsLeadGen",
+        "totalSits",
+        "qfdSitsSelfGen",
+        "qfdSitsLeadGen",
+        "totalQfdSits",
+        "dealsSelfGen",
+        "dealsLeadGen",
+        "totalDeals",
+        "allJobs",
+        "jobsCancelled",
+        "activeDeals",
+        "jobsOnHold",
+        "jobsRedFlagged",
+        "cleanDeals",
+        "totalInstall",
+    ]
+
+    setter_totals = _total_numeric_rows(setter_rows, setter_num_keys)
+    closer_totals = _total_numeric_rows(closer_rows, closer_num_keys)
+
+    setter_totals_row = {"agent": "Total", **setter_totals}
+    setter_totals_row["contactRate"] = _pct(setter_totals["contactsMade"], setter_totals["allDoors"])
+    setter_totals_row["apptSchedRatio"] = (
+        _pct(setter_totals["appointments"], setter_totals["contactsMade"])
+        if setter_totals["contactsMade"]
+        else _pct(setter_totals["appointments"], setter_totals["allDoors"])
+    )
+    setter_totals_row["sitDownRate"] = (
+        _pct(setter_totals["sitdowns"], setter_totals["appointments"]) if setter_totals["appointments"] else 0.0
+    )
+    s_all_jobs = setter_totals["allJobs"]
+    setter_totals_row["cleanPct"] = _pct(setter_totals["cleanDeals"], s_all_jobs) if s_all_jobs else 0.0
+    setter_totals_row["cancellationRate"] = _pct(setter_totals["jobsCancelled"], s_all_jobs) if s_all_jobs else 0.0
+    setter_totals_row["netRetentionRate"] = (
+        _pct(
+            s_all_jobs
+            - (
+                setter_totals["jobsCancelled"]
+                + setter_totals["jobsOnHold"]
+                + setter_totals["jobsRedFlagged"]
+            ),
+            s_all_jobs,
+        )
+        if s_all_jobs
+        else 0.0
+    )
+    setter_totals_row["role"] = ""
+    setter_totals_row["crew"] = ""
+
+    closer_totals_row = {"agent": "Total", **closer_totals}
+    c_all_jobs = closer_totals["allJobs"]
+    c_total_appts = closer_totals["totalAppointments"]
+    c_total_sits = closer_totals["totalSits"]
+    closer_totals_row["sitDownRate"] = _pct(c_total_sits, c_total_appts) if c_total_appts else 0.0
+    closer_totals_row["closingRate"] = _pct(closer_totals["totalDeals"], c_total_sits) if c_total_sits else 0.0
+    closer_totals_row["cleanPct"] = _pct(closer_totals["cleanDeals"], c_all_jobs) if c_all_jobs else 0.0
+    closer_totals_row["cancellationRate"] = _pct(closer_totals["jobsCancelled"], c_all_jobs) if c_all_jobs else 0.0
+    closer_totals_row["netRetentionRate"] = (
+        _pct(
+            c_all_jobs
+            - (
+                closer_totals["jobsCancelled"]
+                + closer_totals["jobsOnHold"]
+                + closer_totals["jobsRedFlagged"]
+            ),
+            c_all_jobs,
+        )
+        if c_all_jobs
+        else 0.0
+    )
+    closer_totals_row["role"] = ""
+    closer_totals_row["crew"] = ""
+
+    return {
+        "setters": setter_rows,
+        "setterTotals": setter_totals_row,
+        "closers": closer_rows,
+        "closerTotals": closer_totals_row,
+        "notes": [
+            'Rows come from Sunbase Users (General - Users Report) filtered by role: setters contain "setter"; closers are Sales or role contains "closer" (excluding setters).',
+            "Facts are matched on Sunbase user's Fullname ↔ Door canvasser / Appointment.setter or sales_rep / Project.setter.",
+            "appointmentDoorsHeuristic counts setter appointments whose lead_source text suggests door/canvass; refine if you add explicit flags from Sunbase.",
+            "Refresh Job List sync after deploying Project.setter so job columns populate.",
+        ],
     }

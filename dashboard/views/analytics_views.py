@@ -16,6 +16,7 @@ from dashboard.services.analytics_service import (
     get_performance_bundle,
     get_pipeline_bundle,
     get_retention_bundle,
+    get_role_performance_bundle,
 )
 from dashboard.services.project_service import get_cancelled_projects, get_on_hold_projects
 from dashboard.services.insights_service import (
@@ -28,7 +29,12 @@ from dashboard.services.insights_service import (
     list_insight_messages,
 )
 from dashboard.services.sunbase_sync_service import get_last_sync_result, run_full_sync
-from dashboard.utils import error_response, parse_dashboard_date_range, success_response
+from dashboard.utils import (
+    error_response,
+    parse_dashboard_date_range,
+    parse_dashboard_filters_full,
+    success_response,
+)
 
 
 class CleanDealsView(APIView):
@@ -85,8 +91,20 @@ class CustomerExperienceView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        d0, d1 = parse_dashboard_date_range(request)
-        return Response(success_response(get_cx_bundle(d0, d1, request.user)))
+        f = parse_dashboard_filters_full(request)
+        return Response(
+            success_response(
+                get_cx_bundle(
+                    f["date_from"],
+                    f["date_to"],
+                    request.user,
+                    installer=f["installer"],
+                    sales_team=f["sales_team"],
+                    lead_source=f["lead_source"],
+                    project_manager=f["manager"],
+                )
+            )
+        )
 
 
 class ManagerPerformanceView(APIView):
@@ -94,8 +112,44 @@ class ManagerPerformanceView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        d0, d1 = parse_dashboard_date_range(request)
-        return Response(success_response(get_manager_bundle(d0, d1, request.user)))
+        f = parse_dashboard_filters_full(request)
+        return Response(
+            success_response(
+                get_manager_bundle(
+                    f["date_from"],
+                    f["date_to"],
+                    request.user,
+                    installer=f["installer"],
+                    sales_team=f["sales_team"],
+                    lead_source=f["lead_source"],
+                    project_manager=f["manager"],
+                )
+            )
+        )
+
+
+class RolePerformanceView(APIView):
+    """
+    Setter / closer style tables keyed off Sunbase Users roles (setter vs Sales/closer).
+    Uses doors, appointments, and projects matched by Fullname ↔ canvasser / setter / sales_rep.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        f = parse_dashboard_filters_full(request)
+        return Response(
+            success_response(
+                get_role_performance_bundle(
+                    f["date_from"],
+                    f["date_to"],
+                    request.user,
+                    installer=f["installer"],
+                    sales_team=f["sales_team"],
+                    lead_source=f["lead_source"],
+                    project_manager=f["manager"],
+                )
+            )
+        )
 
 
 class InsightsGenerateView(APIView):

@@ -4,12 +4,37 @@ from dashboard.models import Project
 from dashboard.scope import project_scope_q
 
 
-def base_queryset(date_from=None, date_to=None, user=None):
+def base_queryset(
+    date_from=None,
+    date_to=None,
+    user=None,
+    *,
+    installer=None,
+    sales_team=None,
+    lead_source=None,
+    project_manager=None,
+):
     qs = Project.objects.filter(deleted_at__isnull=True).filter(project_scope_q(user))
     if date_from:
         qs = qs.filter(customer_since__gte=date_from)
     if date_to:
         qs = qs.filter(customer_since__lte=date_to)
+    if installer:
+        t = str(installer).strip()
+        if t:
+            qs = qs.filter(installer__iexact=t)
+    if sales_team:
+        t = str(sales_team).strip()
+        if t:
+            qs = qs.filter(sales_team__iexact=t)
+    if lead_source:
+        t = str(lead_source).strip()
+        if t:
+            qs = qs.filter(lead_source__iexact=t)
+    if project_manager:
+        t = str(project_manager).strip()
+        if t:
+            qs = qs.filter(project_manager__iexact=t)
     return qs
 
 

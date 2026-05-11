@@ -15,7 +15,7 @@ JOB_LIST_KEY = "6ee21c0ccc5f4562bc5f29fa94eb6900"
 CX_EXPERIENCE_KEY = "280ffb72dbae4ff0b15ac53d6027692c"
 DOORS_LIST_KEY = "17d317dccb734d17931b8e55042643d1"
 APPOINTMENT_STATUS_KEY = "51944068795144e38b0757bdc9123901"
-USERS_REPORT_KEY = "9b2cae57f9e54e60b4e5b62b67e7c5d2"
+USERS_REPORT_KEY = "eaae9b678a7e45f1b27753d7fda297c0"
 
 QUICK_INSTALL_DAYS = 30
 
@@ -301,6 +301,10 @@ def _get_csv_cell(row, *candidates):
         if v is not None and str(v).strip() not in ("", "nan", "NaN", "None"):
             return v
     return None
+
+
+def _csv_bool(value):
+    return (_clean(value) or "").lower() in {"true", "yes", "1"}
 
 
 def _sync_job_list():
@@ -606,7 +610,7 @@ def _sync_users():
     SunbaseUser.objects.all().delete()
     for row in rows:
         try:
-            uuid = _clean(_get_csv_cell(row, "uuid", "User UUID", "User Id")) or ""
+            uuid = _clean(_get_csv_cell(row, "UserEntity.uuid", "uuid", "User UUID", "User Id")) or ""
             full_name = _clean(_get_csv_cell(row, "Fullname", "Full Name", "Name")) or ""
             if not uuid:
                 continue
@@ -616,7 +620,7 @@ def _sync_users():
                 role=_clean(_get_csv_cell(row, "Role", "User Role")) or "",
                 manager_name=_clean(_get_csv_cell(row, "Manager", "Manager Name")) or "",
                 crew_name=_clean(_get_csv_cell(row, "Crew", "Team", "Crew Name")) or "",
-                login_allowed=(_clean(row.get("Login Allowed")) or "").lower() == "yes",
+                login_allowed=_csv_bool(row.get("Login Allowed")),
             )
             inserted += 1
         except Exception as exc:  # pylint: disable=broad-except

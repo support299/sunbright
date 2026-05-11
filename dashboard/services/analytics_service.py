@@ -33,7 +33,15 @@ _ZERO_MONEY = Value(0, output_field=DecimalField(max_digits=15, decimal_places=2
 
 
 def _cx_qs(date_from=None, date_to=None, user=None):
-    qs = CxProject.objects.filter(deleted_at__isnull=True).filter(cx_scope_q(user))
+    today = timezone.now().date()
+    qs = (
+        CxProject.objects.filter(
+            deleted_at__isnull=True,
+            install_date__isnull=False,
+            install_date__lte=today,
+        )
+        .filter(cx_scope_q(user))
+    )
     if date_from:
         qs = qs.filter(install_date__gte=date_from)
     if date_to:

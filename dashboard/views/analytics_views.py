@@ -29,52 +29,121 @@ from dashboard.services.insights_service import (
     list_insight_messages,
 )
 from dashboard.services.sunbase_sync_service import get_last_sync_result, run_full_sync
-from dashboard.utils import (
-    error_response,
-    parse_dashboard_date_range,
-    parse_dashboard_filters_full,
-    success_response,
-)
+from dashboard.utils import error_response, parse_dashboard_filters_full, success_response
 
 
 class CleanDealsView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        d0, d1 = parse_dashboard_date_range(request)
-        return Response(success_response(get_clean_deals_bundle(d0, d1, request.user)))
+        f = parse_dashboard_filters_full(request)
+        return Response(
+            success_response(
+                get_clean_deals_bundle(
+                    f["date_from"],
+                    f["date_to"],
+                    request.user,
+                    installer=f["installer"],
+                    sales_team=f["sales_team"],
+                    lead_source=f["lead_source"],
+                    project_manager=f["manager"],
+                    market=f["market"],
+                    rep_kind=f["rep_kind"],
+                    rep_name=f["rep_name"],
+                )
+            )
+        )
 
 
 class RetentionView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        d0, d1 = parse_dashboard_date_range(request)
-        return Response(success_response(get_retention_bundle(d0, d1, request.user)))
+        f = parse_dashboard_filters_full(request)
+        return Response(
+            success_response(
+                get_retention_bundle(
+                    f["date_from"],
+                    f["date_to"],
+                    request.user,
+                    installer=f["installer"],
+                    sales_team=f["sales_team"],
+                    lead_source=f["lead_source"],
+                    project_manager=f["manager"],
+                    market=f["market"],
+                    rep_kind=f["rep_kind"],
+                    rep_name=f["rep_name"],
+                )
+            )
+        )
 
 
 class PerformanceView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        d0, d1 = parse_dashboard_date_range(request)
-        return Response(success_response(get_performance_bundle(d0, d1, request.user)))
+        f = parse_dashboard_filters_full(request)
+        return Response(
+            success_response(
+                get_performance_bundle(
+                    f["date_from"],
+                    f["date_to"],
+                    request.user,
+                    installer=f["installer"],
+                    sales_team=f["sales_team"],
+                    lead_source=f["lead_source"],
+                    project_manager=f["manager"],
+                    market=f["market"],
+                    rep_kind=f["rep_kind"],
+                    rep_name=f["rep_name"],
+                )
+            )
+        )
 
 
 class PipelineView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        d0, d1 = parse_dashboard_date_range(request)
-        return Response(success_response(get_pipeline_bundle(d0, d1, request.user)))
+        f = parse_dashboard_filters_full(request)
+        return Response(
+            success_response(
+                get_pipeline_bundle(
+                    f["date_from"],
+                    f["date_to"],
+                    request.user,
+                    installer=f["installer"],
+                    sales_team=f["sales_team"],
+                    lead_source=f["lead_source"],
+                    project_manager=f["manager"],
+                    market=f["market"],
+                    rep_kind=f["rep_kind"],
+                    rep_name=f["rep_name"],
+                )
+            )
+        )
 
 
 class ProjectsOnHoldView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        d0, d1 = parse_dashboard_date_range(request)
-        serializer = ProjectSerializer(get_on_hold_projects(d0, d1, request.user), many=True)
+        f = parse_dashboard_filters_full(request)
+        serializer = ProjectSerializer(
+            get_on_hold_projects(
+                f["date_from"],
+                f["date_to"],
+                request.user,
+                installer=f["installer"],
+                sales_team=f["sales_team"],
+                lead_source=f["lead_source"],
+                project_manager=f["manager"],
+                market=f["market"],
+                rep_kind=f["rep_kind"],
+                rep_name=f["rep_name"],
+            ),
+            many=True,
+        )
         return Response(success_response(serializer.data))
 
 
@@ -82,8 +151,22 @@ class ProjectsCancelledView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        d0, d1 = parse_dashboard_date_range(request)
-        serializer = ProjectSerializer(get_cancelled_projects(d0, d1, request.user), many=True)
+        f = parse_dashboard_filters_full(request)
+        serializer = ProjectSerializer(
+            get_cancelled_projects(
+                f["date_from"],
+                f["date_to"],
+                request.user,
+                installer=f["installer"],
+                sales_team=f["sales_team"],
+                lead_source=f["lead_source"],
+                project_manager=f["manager"],
+                market=f["market"],
+                rep_kind=f["rep_kind"],
+                rep_name=f["rep_name"],
+            ),
+            many=True,
+        )
         return Response(success_response(serializer.data))
 
 
@@ -102,6 +185,9 @@ class CustomerExperienceView(APIView):
                     sales_team=f["sales_team"],
                     lead_source=f["lead_source"],
                     project_manager=f["manager"],
+                    market=f["market"],
+                    rep_kind=f["rep_kind"],
+                    rep_name=f["rep_name"],
                 )
             )
         )
@@ -123,6 +209,9 @@ class ManagerPerformanceView(APIView):
                     sales_team=f["sales_team"],
                     lead_source=f["lead_source"],
                     project_manager=f["manager"],
+                    market=f["market"],
+                    rep_kind=f["rep_kind"],
+                    rep_name=f["rep_name"],
                 )
             )
         )
@@ -147,6 +236,9 @@ class RolePerformanceView(APIView):
                     sales_team=f["sales_team"],
                     lead_source=f["lead_source"],
                     project_manager=f["manager"],
+                    market=f["market"],
+                    rep_kind=f["rep_kind"],
+                    rep_name=f["rep_name"],
                 )
             )
         )
@@ -156,9 +248,20 @@ class InsightsGenerateView(APIView):
     permission_classes = [IsAuthenticated, IsDashboardAdmin]
 
     def post(self, request):
-        d0, d1 = parse_dashboard_date_range(request)
+        f = parse_dashboard_filters_full(request)
         try:
-            payload = generate_dashboard_insights(d0, d1, request.user)
+            payload = generate_dashboard_insights(
+                f["date_from"],
+                f["date_to"],
+                request.user,
+                installer=f["installer"],
+                sales_team=f["sales_team"],
+                lead_source=f["lead_source"],
+                project_manager=f["manager"],
+                market=f["market"],
+                rep_kind=f["rep_kind"],
+                rep_name=f["rep_name"],
+            )
         except InsightsLLMError as exc:
             return Response(
                 error_response([{"field": "llm", "message": str(exc)}]),
@@ -192,6 +295,13 @@ class InsightsChatView(APIView):
                 conversation_id=payload.get("conversationId"),
                 date_from=payload.get("dateFrom"),
                 date_to=payload.get("dateTo"),
+                sales_team=(payload.get("salesTeam") or "").strip() or None,
+                installer=(payload.get("installer") or "").strip() or None,
+                lead_source=(payload.get("leadSource") or "").strip() or None,
+                project_manager=(payload.get("manager") or "").strip() or None,
+                market=(payload.get("market") or "").strip() or None,
+                rep_kind=payload.get("repKind"),
+                rep_name=(payload.get("repName") or "").strip() or None,
             )
         except InsightsRateLimitError as exc:
             return Response(error_response([{"field": "rateLimit", "message": str(exc)}]), status=429)

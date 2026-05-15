@@ -10,8 +10,10 @@ from django.db.models import (
     Avg,
     Count,
     DecimalField,
+    Exists,
     Max,
     Min,
+    OuterRef,
     Q,
     Sum,
     Value,
@@ -22,14 +24,32 @@ from django.utils import timezone
 from dashboard.models import (
     Appointment,
     CxProject,
-    DashboardDataScope,
     Door,
     SunbaseUser,
 )
-from dashboard.scope import appointment_scope_q, cx_scope_q, door_scope_q
+from dashboard.scope import appointment_scope_q, cx_scope_q, door_scope_q, scoped_sunbase_users
 from dashboard.services.project_service import base_queryset
 
 _ZERO_MONEY = Value(0, output_field=DecimalField(max_digits=15, decimal_places=2))
+
+
+def _filter_appts_doors_by_person_names(appts, doors, names: list[str]):
+    names = [n.strip() for n in names if n and str(n).strip()]
+    if not names:
+        return appts.none(), doors.none()
+    appt_q = reduce(or_, (Q(sales_rep__iexact=n) | Q(setter__iexact=n) for n in names))
+    door_q = reduce(or_, (Q(canvasser__iexact=n) for n in names))
+    return appts.filter(appt_q), doors.filter(door_q)
+
+
+def _apply_rep_filter_appts_doors(appts, doors, rep_kind, rep_name):
+    rk = (rep_kind or "").strip().lower() if rep_kind else ""
+    rn = (rep_name or "").strip() if rep_name else ""
+    if rk == "sales_rep" and rn:
+        return appts.filter(sales_rep__iexact=rn), doors.none()
+    if rk == "setter" and rn:
+        return appts.filter(setter__iexact=rn), doors.filter(canvasser__iexact=rn)
+    return appts, doors
 
 
 def _cx_qs(date_from=None, date_to=None, user=None):
@@ -267,8 +287,31 @@ def _aggregate_clean_deal_dimension(rows, group_field_names):
     return out[:200]
 
 
-def get_clean_deals_bundle(date_from=None, date_to=None, user=None):
-    qs = base_queryset(date_from, date_to, user)
+def get_clean_deals_bundle(
+    date_from=None,
+    date_to=None,
+    user=None,
+    *,
+    installer=None,
+    sales_team=None,
+    lead_source=None,
+    project_manager=None,
+    market=None,
+    rep_kind=None,
+    rep_name=None,
+):
+    qs = base_queryset(
+        date_from,
+        date_to,
+        user,
+        installer=installer,
+        sales_team=sales_team,
+        lead_source=lead_source,
+        project_manager=project_manager,
+        market=market,
+        rep_kind=rep_kind,
+        rep_name=rep_name,
+    )
     today = timezone.now().date()
 
     analysis = [
@@ -323,8 +366,31 @@ def _retention_row(base_qs, group_fields):
     return out
 
 
-def get_retention_bundle(date_from=None, date_to=None, user=None):
-    qs = base_queryset(date_from, date_to, user)
+def get_retention_bundle(
+    date_from=None,
+    date_to=None,
+    user=None,
+    *,
+    installer=None,
+    sales_team=None,
+    lead_source=None,
+    project_manager=None,
+    market=None,
+    rep_kind=None,
+    rep_name=None,
+):
+    qs = base_queryset(
+        date_from,
+        date_to,
+        user,
+        installer=installer,
+        sales_team=sales_team,
+        lead_source=lead_source,
+        project_manager=project_manager,
+        market=market,
+        rep_kind=rep_kind,
+        rep_name=rep_name,
+    )
     return {
         "byRep": _retention_row(qs.exclude(sales_rep=""), ["sales_rep", "sales_team"]),
         "byTeam": _retention_row(qs.exclude(sales_team=""), ["sales_team"]),
@@ -333,8 +399,31 @@ def get_retention_bundle(date_from=None, date_to=None, user=None):
     }
 
 
-def get_performance_bundle(date_from=None, date_to=None, user=None):
-    qs = base_queryset(date_from, date_to, user)
+def get_performance_bundle(
+    date_from=None,
+    date_to=None,
+    user=None,
+    *,
+    installer=None,
+    sales_team=None,
+    lead_source=None,
+    project_manager=None,
+    market=None,
+    rep_kind=None,
+    rep_name=None,
+):
+    qs = base_queryset(
+        date_from,
+        date_to,
+        user,
+        installer=installer,
+        sales_team=sales_team,
+        lead_source=lead_source,
+        project_manager=project_manager,
+        market=market,
+        rep_kind=rep_kind,
+        rep_name=rep_name,
+    )
     perf_cols = ("customer_since", "install_date", "is_clean_deal")
     rep_install_rows = list(qs.exclude(sales_rep="").values("sales_rep", "sales_team", *perf_cols))
     rep_install = _avg_install_metrics_by_group(rep_install_rows, ("sales_rep", "sales_team"))
@@ -487,14 +576,37 @@ _PIPELINE_FUNNEL_ORDER = (
 )
 
 
-def get_pipeline_bundle(date_from=None, date_to=None, user=None):
+def get_pipeline_bundle(
+    date_from=None,
+    date_to=None,
+    user=None,
+    *,
+    installer=None,
+    sales_team=None,
+    lead_source=None,
+    project_manager=None,
+    market=None,
+    rep_kind=None,
+    rep_name=None,
+):
     """
     Pipeline visualisation bundle.
 
     Returns velocity rows (one per project) + canonical funnel buckets,
     CRC analytics, deals-pipeline counters, and the quick-install rollup.
     """
-    qs = base_queryset(date_from, date_to, user)
+    qs = base_queryset(
+        date_from,
+        date_to,
+        user,
+        installer=installer,
+        sales_team=sales_team,
+        lead_source=lead_source,
+        project_manager=project_manager,
+        market=market,
+        rep_kind=rep_kind,
+        rep_name=rep_name,
+    )
     today = timezone.now().date()
     fields = (
         "id",
@@ -731,32 +843,56 @@ def get_cx_bundle(
     sales_team=None,
     lead_source=None,
     project_manager=None,
+    market=None,
+    rep_kind=None,
+    rep_name=None,
 ):
     cx = _cx_qs(date_from, date_to, user)
 
     inst_clean = (installer or "").strip() if installer else ""
     if inst_clean:
-        cx = cx.filter(installer__iexact=inst_clean)
+        q_inst = Q(installer__iexact=inst_clean) | Q(installer_ref__name__iexact=inst_clean)
+        cx = cx.filter(q_inst)
 
-    extra_dims = any(
-        v and str(v).strip() for v in (sales_team, lead_source, project_manager)
+    rk = (rep_kind or "").strip().lower() if rep_kind else ""
+    rn = (rep_name or "").strip() if rep_name else ""
+    rep_active = rk in ("sales_rep", "setter") and bool(rn)
+    extra_dims = (
+        any(v and str(v).strip() for v in (sales_team, lead_source, project_manager, market)) or rep_active
     )
     if extra_dims:
-        proj_qs = base_queryset(
-            date_from,
-            date_to,
+        # CX rows are scoped by install_date in `_cx_qs`, while `base_queryset` filters projects by
+        # customer_since. Applying the same date window here drops almost all UUID matches (zeros in UI).
+        # Dimensional filters (team, lead source, PM, market) should match the *job* regardless of that
+        # customer_since vs install_date mismatch; the time window stays on CX via `_cx_qs` above.
+        proj_dims = base_queryset(
+            None,
+            None,
             user,
             installer=installer,
             sales_team=sales_team,
             lead_source=lead_source,
             project_manager=project_manager,
+            market=market,
+            rep_kind=rep_kind,
+            rep_name=rep_name,
         )
-        uuid_set = list(
-            proj_qs.exclude(sunbase_job_uuid="")
-            .values_list("sunbase_job_uuid", flat=True)
-            .distinct()
+        uuid_link = Exists(
+            proj_dims.filter(
+                ~Q(sunbase_job_uuid=""),
+                sunbase_job_uuid=OuterRef("sunbase_job_uuid"),
+            )
         )
-        cx = cx.filter(sunbase_job_uuid__in=uuid_set) if uuid_set else cx.none()
+        # When UUIDs are missing or out of sync between CX and Project CSVs, fall back to a tight row match.
+        identity_link = Exists(
+            proj_dims.filter(
+                first_name__iexact=OuterRef("first_name"),
+                last_name__iexact=OuterRef("last_name"),
+                installer__iexact=OuterRef("installer"),
+                install_date=OuterRef("install_date"),
+            ).exclude(first_name="", last_name="")
+        )
+        cx = cx.filter(uuid_link | identity_link)
 
     total = cx.count()
     reviews = cx.filter(has_review=True).count()
@@ -1184,11 +1320,31 @@ def get_manager_bundle(
     sales_team=None,
     lead_source=None,
     project_manager=None,
+    market=None,
+    rep_kind=None,
+    rep_name=None,
 ):
     appts = _appt_qs(date_from, date_to, user)
     if sales_team and str(sales_team).strip():
         appts = appts.filter(sales_team__iexact=str(sales_team).strip())
     doors = _door_qs(date_from, date_to, user)
+    if lead_source and str(lead_source).strip():
+        appts = appts.filter(lead_source__iexact=str(lead_source).strip())
+
+    pm_clean = (project_manager or "").strip() if project_manager else ""
+    if pm_clean:
+        sb = scoped_sunbase_users(user).filter(manager_name__iexact=pm_clean).exclude(full_name="")
+        if sales_team and str(sales_team).strip():
+            t = str(sales_team).strip()
+            sb = sb.filter(Q(crew_name__iexact=t) | Q(team__name__iexact=t))
+        nm_list = [n.strip() for n in sb.values_list("full_name", flat=True).distinct() if n and str(n).strip()]
+        if not nm_list:
+            appts = appts.none()
+            doors = doors.none()
+        else:
+            appts, doors = _filter_appts_doors_by_person_names(appts, doors, nm_list)
+
+    appts, doors = _apply_rep_filter_appts_doors(appts, doors, rep_kind, rep_name)
 
     rep_rows = (
         appts.exclude(sales_rep="")
@@ -1322,6 +1478,9 @@ def get_manager_bundle(
         sales_team=sales_team,
         lead_source=lead_source,
         project_manager=project_manager,
+        market=market,
+        rep_kind=rep_kind,
+        rep_name=rep_name,
     )
     overview = {
         "totalProjects": pq.count(),
@@ -1345,38 +1504,6 @@ def get_manager_bundle(
     }
 
 
-def _scoped_sunbase_users(user):
-    """Sunbase directory rows visible under the same dashboard data scope as facts."""
-    qs = SunbaseUser.objects.all()
-    if user is None or getattr(user, "is_staff", False) or not getattr(user, "is_authenticated", False):
-        return qs
-    try:
-        ds = user.dashboard_scope
-    except DashboardDataScope.DoesNotExist:
-        return SunbaseUser.objects.none()
-
-    kind = ds.scope_kind
-    if kind == DashboardDataScope.ScopeKind.TEAM:
-        if not (ds.sales_team or "").strip():
-            return SunbaseUser.objects.none()
-        t = ds.sales_team.strip()
-        return qs.filter(Q(crew_name__iexact=t) | Q(team__name__iexact=t))
-
-    if kind == DashboardDataScope.ScopeKind.TEAMS:
-        names = [n.strip() for n in (ds.sales_teams or []) if isinstance(n, str) and n.strip()]
-        if not names:
-            return SunbaseUser.objects.none()
-        team_q = reduce(or_, (Q(crew_name__iexact=n) | Q(team__name__iexact=n) for n in names))
-        return qs.filter(team_q)
-
-    if kind == DashboardDataScope.ScopeKind.REP:
-        if not (ds.sales_rep or "").strip():
-            return SunbaseUser.objects.none()
-        return qs.filter(full_name__iexact=ds.sales_rep.strip())
-
-    return SunbaseUser.objects.none()
-
-
 def _total_numeric_rows(rows, keys):
     out = {k: 0 for k in keys}
     for r in rows:
@@ -1398,6 +1525,9 @@ def get_role_performance_bundle(
     sales_team=None,
     lead_source=None,
     project_manager=None,
+    market=None,
+    rep_kind=None,
+    rep_name=None,
 ):
     """
     Role-based agent tables aligned with Sunbase Users (role, crew).
@@ -1418,6 +1548,9 @@ def get_role_performance_bundle(
         sales_team=sales_team,
         lead_source=lead_source,
         project_manager=project_manager,
+        market=market,
+        rep_kind=rep_kind,
+        rep_name=rep_name,
     )
 
     sales_team_clean = (sales_team or "").strip() if sales_team else ""
@@ -1426,6 +1559,36 @@ def get_role_performance_bundle(
     lead_source_clean = (lead_source or "").strip() if lead_source else ""
     if lead_source_clean:
         appts = appts.filter(lead_source__iexact=lead_source_clean)
+
+    sunbase_base = scoped_sunbase_users(user).exclude(full_name="").exclude(role__iexact="admin")
+
+    pm_clean = (project_manager or "").strip() if project_manager else ""
+    sunbase_for_roles = sunbase_base
+    if sales_team_clean:
+        team_sq = Q(crew_name__iexact=sales_team_clean) | Q(team__name__iexact=sales_team_clean)
+        sunbase_for_roles = sunbase_for_roles.filter(team_sq)
+        team_canvasser_keys = set(
+            sunbase_base.filter(team_sq).annotate(lk=Lower("full_name")).values_list("lk", flat=True)
+        )
+        if team_canvasser_keys:
+            doors = doors.annotate(_door_team_lk=Lower("canvasser")).filter(_door_team_lk__in=team_canvasser_keys)
+        else:
+            doors = doors.none()
+
+    if pm_clean:
+        sunbase_for_roles = sunbase_for_roles.filter(manager_name__iexact=pm_clean)
+        nm_list = [
+            n.strip()
+            for n in sunbase_for_roles.values_list("full_name", flat=True).distinct()
+            if n and str(n).strip()
+        ]
+        if not nm_list:
+            appts = appts.none()
+            doors = doors.none()
+        else:
+            appts, doors = _filter_appts_doors_by_person_names(appts, doors, nm_list)
+
+    appts, doors = _apply_rep_filter_appts_doors(appts, doors, rep_kind, rep_name)
 
     appt_doorish_q = (
         Q(lead_source__icontains="door")
@@ -1518,9 +1681,7 @@ def get_role_performance_bundle(
     ):
         appt_by_rep[row["_lk"]] = row
 
-    sunbase_qs = _scoped_sunbase_users(user).exclude(full_name="").exclude(role__iexact="admin")
-
-    setter_users = sunbase_qs.filter(role__icontains="setter")
+    setter_users = sunbase_for_roles.filter(role__icontains="setter")
     setter_rows = []
     for su in setter_users.order_by("full_name")[:400]:
         name = (su.full_name or "").strip()
@@ -1583,7 +1744,7 @@ def get_role_performance_bundle(
             }
         )
 
-    closer_users = sunbase_qs.filter(Q(role__iexact="Sales") | Q(role__icontains="closer")).exclude(
+    closer_users = sunbase_for_roles.filter(Q(role__iexact="Sales") | Q(role__icontains="closer")).exclude(
         role__icontains="setter"
     )
     closer_rows = []

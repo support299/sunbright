@@ -7,12 +7,15 @@ import logging
 import os
 import re
 import time
+import difflib
 import hashlib
 import urllib.error
 import urllib.request
+from datetime import date, timedelta
 from typing import Any
 
 from django.core.cache import cache
+from django.utils import timezone
 
 from dashboard.models import InsightConversation, InsightMessage
 from dashboard.services.analytics_service import (
@@ -22,8 +25,10 @@ from dashboard.services.analytics_service import (
     get_performance_bundle,
     get_pipeline_bundle,
     get_retention_bundle,
+    get_role_performance_bundle,
 )
 from dashboard.services.project_service import (
+    base_queryset,
     get_category_breakdown,
     get_cancellation_reasons_breakdown,
     get_cancelled_projects,
@@ -94,7 +99,7 @@ def _chat_max_output_tokens() -> int:
             return max(128, min(int(raw), 8192))
         except ValueError:
             pass
-    return 800
+    return 1200
 
 
 def _chat_max_input_tokens() -> int:
@@ -125,6 +130,156 @@ def _chat_daily_quota() -> int:
         except ValueError:
             pass
     return 0
+
+
+def _chat_dim_sig_for_vocab(
+    installer=None,
+    sales_team=None,
+    lead_source=None,
+    project_manager=None,
+    market=None,
+    rep_kind=None,
+    rep_name=None,
+) -> str:
+    parts = []
+    if installer and str(installer).strip():
+        parts.append(f"i:{str(installer).strip().lower()}")
+    if sales_team and str(sales_team).strip():
+        parts.append(f"t:{str(sales_team).strip().lower()}")
+    if lead_source and str(lead_source).strip():
+        parts.append(f"l:{str(lead_source).strip().lower()}")
+    if project_manager and str(project_manager).strip():
+        parts.append(f"p:{str(project_manager).strip().lower()}")
+    if market and str(market).strip():
+        parts.append(f"k:{str(market).strip().lower()}")
+    rk = (rep_kind or "").strip().lower() if rep_kind else ""
+    rn = (rep_name or "").strip() if rep_name else ""
+    if rk in ("sales_rep", "setter") and rn:
+        parts.append(f"r:{rk}:{rn.lower()}")
+    return "|".join(sorted(parts)) if parts else "all"
+
+
+def _load_chat_rep_setter_vocab(
+    user,
+    date_from,
+    date_to,
+    *,
+    installer=None,
+    sales_team=None,
+    lead_source=None,
+    project_manager=None,
+    market=None,
+    rep_kind=None,
+    rep_name=None,
+) -> list[str]:
+    """
+    Distinct sales_rep / setter names in the current filter window so natural-language
+    questions ("what about Eddie Lopez") can be classified as dashboard queries.
+    Cached briefly to avoid repeated DISTINCT scans during a chat session.
+    """
+    dim_sig = _chat_dim_sig_for_vocab(
+        installer=installer,
+        sales_team=sales_team,
+        lead_source=lead_source,
+        project_manager=project_manager,
+        market=market,
+        rep_kind=rep_kind,
+        rep_name=rep_name,
+    )
+    raw_key = f"{getattr(user, 'id', 0)}|{date_from}|{date_to}|{dim_sig}"
+    digest = hashlib.md5(raw_key.encode("utf-8")).hexdigest()
+    cache_key = f"insights_chat:vocab:{digest}"
+    cached = cache.get(cache_key)
+    if isinstance(cached, list):
+        return cached
+
+    qs = base_queryset(
+        date_from,
+        date_to,
+        user,
+        installer=installer,
+        sales_team=sales_team,
+        lead_source=lead_source,
+        project_manager=project_manager,
+        market=market,
+        rep_kind=rep_kind,
+        rep_name=rep_name,
+    )
+    names: set[str] = set()
+    for field in ("sales_rep", "setter"):
+        for val in (
+            qs.exclude(**{f"{field}__exact": ""})
+            .values_list(field, flat=True)
+            .distinct()[:500]
+        ):
+            n = str(val or "").strip().lower()
+            if len(n) >= 4:
+                names.add(re.sub(r"\s+", " ", n))
+    out = sorted(names)
+    cache.set(cache_key, out, timeout=300)
+    return out
+
+
+def _vocab_hits_exact(message: str, vocab: list[str]) -> list[str]:
+    if not message or not vocab:
+        return []
+    normalized = re.sub(r"[^\w\s]", " ", message.lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized:
+        return []
+    hits: list[str] = []
+    seen: set[str] = set()
+    for name in sorted(set(vocab), key=len, reverse=True):
+        n = str(name).strip().lower()
+        if len(n) < 4:
+            continue
+        if n in normalized and n not in seen:
+            hits.append(n)
+            seen.add(n)
+    return hits
+
+
+def _fuzzy_vocab_hits_in_message(message: str, vocab: list[str], *, ratio_min: float = 0.84) -> list[str]:
+    """
+    Match two-word names with small typos (e.g. 'eddi lopez' vs 'eddie lopez') using sequence similarity.
+    """
+    if not message or not vocab:
+        return []
+    normalized = re.sub(r"[^\w\s]", " ", message.lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    tokens = normalized.split()
+    if len(tokens) < 2:
+        return []
+    hits: list[str] = []
+    seen: set[str] = set()
+    for i in range(len(tokens) - 1):
+        candidate = f"{tokens[i]} {tokens[i + 1]}"
+        if len(candidate) < 6:
+            continue
+        for name in vocab:
+            n = str(name).strip().lower()
+            if len(n) < 6 or n in seen:
+                continue
+            if difflib.SequenceMatcher(None, candidate, n).ratio() >= ratio_min:
+                hits.append(n)
+                seen.add(n)
+    return hits
+
+
+def _message_matches_vocab_name(message: str, vocab: list[str]) -> bool:
+    if not message or not vocab:
+        return False
+    if _vocab_hits_exact(message, vocab):
+        return True
+    return bool(_fuzzy_vocab_hits_in_message(message, vocab))
+
+
+def _vocab_hits_in_message(message: str, vocab: list[str]) -> list[str]:
+    """Return distinct vocab names (lowercase): exact substring match, then fuzzy two-word match."""
+    exact = _vocab_hits_exact(message, vocab)
+    if exact:
+        return exact
+    return _fuzzy_vocab_hits_in_message(message, vocab)
 
 
 INSIGHTS_JSON_SCHEMA: dict[str, Any] = {
@@ -236,20 +391,42 @@ INSIGHTS_JSON_SCHEMA: dict[str, Any] = {
 }
 
 
-def gather_insights_context(date_from, date_to, user) -> dict[str, Any]:
-    perf = get_performance_bundle(date_from, date_to, user)
-    cx = get_cx_bundle(date_from, date_to, user)
-    retention = get_retention_bundle(date_from, date_to, user)
-    clean = get_clean_deals_bundle(date_from, date_to, user)
+def gather_insights_context(
+    date_from,
+    date_to,
+    user,
+    *,
+    installer=None,
+    sales_team=None,
+    lead_source=None,
+    project_manager=None,
+    market=None,
+    rep_kind=None,
+    rep_name=None,
+) -> dict[str, Any]:
+    dim_kw = dict(
+        installer=installer,
+        sales_team=sales_team,
+        lead_source=lead_source,
+        project_manager=project_manager,
+        market=market,
+        rep_kind=rep_kind,
+        rep_name=rep_name,
+    )
+    perf = get_performance_bundle(date_from, date_to, user, **dim_kw)
+    cx = get_cx_bundle(date_from, date_to, user, **dim_kw)
+    retention = get_retention_bundle(date_from, date_to, user, **dim_kw)
+    clean = get_clean_deals_bundle(date_from, date_to, user, **dim_kw)
     return {
-        "overview": get_overview_metrics(date_from, date_to, user),
+        "overview": get_overview_metrics(date_from, date_to, user, **dim_kw),
         "repPerformance": (perf.get("reps") or [])[:15],
         "teamPerformance": (perf.get("teams") or [])[:15],
         "cleanDealsByRep": (clean.get("byRep") or [])[:15],
+        "cleanDealPortfolio": _shape_clean_deal_portfolio_for_chat(clean.get("analysis") or []),
         "retentionByRep": (retention.get("byRep") or [])[:15],
         "retentionByLeadSource": (retention.get("byLeadSource") or [])[:25],
-        "cancellationReasons": get_cancellation_reasons_breakdown(date_from, date_to, user)[:25],
-        "onHoldReasons": get_on_hold_reasons_breakdown(date_from, date_to, user)[:25],
+        "cancellationReasons": get_cancellation_reasons_breakdown(date_from, date_to, user, **dim_kw)[:25],
+        "onHoldReasons": get_on_hold_reasons_breakdown(date_from, date_to, user, **dim_kw)[:25],
         "cxOverview": cx.get("overview"),
         "cxByInstaller": (cx.get("byInstaller") or [])[:15],
     }
@@ -635,11 +812,20 @@ def _heuristic_insights_from_context(ctx: dict[str, Any]) -> dict[str, Any]:
 CHAT_SYSTEM_PROMPT = """You are an AI assistant for Sunbright analytics dashboard.
 
 Rules:
-- Only use provided dashboard data when answering dashboard-related questions.
-- Do not hallucinate metrics or values.
-- If some data is missing, still provide best-effort analysis from available metrics and clearly label limitations.
-- Keep answers concise and business-focused.
-- Politely redirect unrelated questions back to Sunbright analytics help."""
+- You receive a **wide dashboard context pack** (overview, rep/setter samples, retention/cancellation headlines, clean-deal portfolio, optional focus rows, thread previews). `scope_hint` is only a weak hint from keywords—not an exhaustive list of what matters; infer what the user cares about from their message and prior turns.
+- **`requested_window`** describes the date range already applied to this payload (including conversational phrases like “this month”). Treat it as authoritative: never say the dashboard “has no month filter” or that you cannot apply a timeframe when `requested_window` is present. Open with a one-line timeframe anchor only when helpful (e.g. “For May 1–14…”).
+- If **`comparison_window`** is present, give directional month-over-week or period-vs-period commentary using both overviews; avoid claiming you lack history when that block is populated.
+- Only use provided dashboard data when answering analytics questions. Do not invent metrics.
+- **Tone:** answer with what the data *does* show first—synthesis, momentum, trade-offs. Do not lead with disclaimers, “I cannot,” or “I do not have access.” If something is genuinely missing, mention it briefly after the substantive answer.
+- **Avoid repetitive KPI dumps:** do not restate cancellation %, retention %, and clean-deal stats every turn unless the user asked about them or they are central to the question. Prefer the metrics most relevant to the latest user message and `continuity.active_topic`.
+- If `ambiguous_entities` is non-empty, two or more people may match the user's wording: ask **one** short clarifying question (name + role) before picking metrics; do not guess.
+- If some slice is missing, still deliver the best partial read, then note the gap in one short phrase.
+- Use prior turns plus `thread_hints` and `continuity` for follow-ups (“what about X”, “same for last month”).
+- When `rep_focus` or `setter_role_metrics_focus` is non-empty, lead with that person's numbers (doors, contacts, appointments, sit-downs, sitDownRate, etc.). Do not claim you have no data if those arrays are populated.
+- If focus arrays are empty and the user named someone, say they may be outside current filters and suggest widening dates/team/manager—do not invent numbers.
+- Use `clean_deal_portfolio` for clean vs non-clean cancellation comparisons when present.
+- Prefer short paragraphs and bullets with concrete numbers. Avoid robotic canned refusals; stay conversational.
+- If the user asks something clearly unrelated to Sunbright analytics, redirect briefly to dashboard topics."""
 
 CHAT_FALLBACK_MESSAGE = "I’m having trouble generating insights right now. Please try again."
 
@@ -664,83 +850,362 @@ def _detect_safety_flags(message: str) -> dict[str, Any]:
     }
 
 
-def _classify_intent(message: str) -> str:
-    text = message.lower().strip()
-    if not text:
+def _classify_intent(message: str, *, safety_flags: dict[str, Any] | None = None) -> str:
+    """
+    Phase 1: default to analytics conversation for this product surface.
+    Only refuse on prompt-injection heuristics; use GREETING for short pleasantries.
+    """
+    text = (message or "").strip()
+    lowered = text.lower()
+    if not lowered:
         return InsightMessage.IntentLabel.GREETING_SMALLTALK
 
-    dashboard_signals = (
-        # Broad analytics terms
-        "dashboard",
-        "metric",
-        "insight",
-        "analysis",
-        "trend",
-        "kpi",
-        # Executive overview
-        "overview",
-        "revenue",
-        "contract",
-        "active pipeline",
-        # Clean deals
-        "clean deal",
-        "clean deals",
-        "deal quality",
-        "realization ratio",
-        # Retention / cancellations / on-hold
-        "retention",
-        "churn",
-        "cancel",
-        "cancellation",
-        "cancelled",
-        "on hold",
-        "red flagged",
-        # Performance
-        "revenue",
-        "sales",
-        "project",
-        "pipeline",
-        "pipeline velocity",
-        "cx",
-        "customer experience",
-        "installer",
-        "rep",
-        "team",
-        # Manager performance / outcome pending
-        "manager",
-        "manager performance",
-        "sit down",
-        "qualified sit down",
-        "closing rate",
-        "pending outcome",
-        "outcome pending",
-        "door stats",
-        # Sidebar labels
-        "executive overview",
-        "clean deals",
-        "retention",
-        "rep performance",
-        "team performance",
-        "pipeline velocity",
-        "on hold details",
-        "cancellations",
-        "customer experience",
-        "manager performance",
-        "outcome pending",
+    if safety_flags and safety_flags.get("possiblePromptInjection"):
+        return InsightMessage.IntentLabel.OUT_OF_SCOPE
+
+    if len(lowered) <= 48 and re.match(
+        r"^(hi|hello|hey|good morning|good afternoon|good evening)\b",
+        lowered,
+    ):
+        return InsightMessage.IntentLabel.GREETING_SMALLTALK
+    if len(lowered) <= 32 and lowered in ("thanks", "thank you", "thank you!", "ty", "ok", "okay", "bye", "goodbye"):
+        return InsightMessage.IntentLabel.GREETING_SMALLTALK
+
+    return InsightMessage.IntentLabel.DASHBOARD_QUERY
+
+
+def _today_in_app_tz() -> date:
+    return timezone.localdate()
+
+
+def _weekday_monday(d: date) -> date:
+    return d - timedelta(days=d.weekday())
+
+
+def _first_day_of_month(d: date) -> date:
+    return date(d.year, d.month, 1)
+
+
+def _last_calendar_month_range(today: date) -> tuple[date, date]:
+    first_this = _first_day_of_month(today)
+    end = first_this - timedelta(days=1)
+    start = _first_day_of_month(end)
+    return start, end
+
+
+def _quarter_index(month: int) -> int:
+    return (month - 1) // 3 + 1
+
+
+def _quarter_range(year: int, quarter: int) -> tuple[date, date]:
+    starts = {1: (1, 1), 2: (4, 1), 3: (7, 1), 4: (10, 1)}
+    sm, sd = starts[quarter]
+    start = date(year, sm, sd)
+    if quarter == 4:
+        end = date(year, 12, 31)
+    else:
+        nsm = starts[quarter + 1][0]
+        end = date(year, nsm, 1) - timedelta(days=1)
+    return start, end
+
+
+def _previous_calendar_quarter_range(today: date) -> tuple[date, date]:
+    cq = _quarter_index(today.month)
+    cy = today.year
+    if cq == 1:
+        return _quarter_range(cy - 1, 4)
+    return _quarter_range(cy, cq - 1)
+
+
+def _human_date_window(d0: date, d1: date) -> str:
+    def month_day(d: date) -> str:
+        return f"{d.strftime('%b')} {d.day}, {d.year}"
+
+    if d0 == d1:
+        return month_day(d0)
+    if d0.year == d1.year and d0.month == d1.month:
+        return f"{d0.strftime('%b')} {d0.day}–{d1.day}, {d1.year}"
+    if d0.year == d1.year:
+        return f"{d0.strftime('%b')} {d0.day}–{month_day(d1)}"
+    return f"{month_day(d0)}–{month_day(d1)}"
+
+
+def _infer_active_topic(message: str) -> str | None:
+    low = (message or "").lower()
+    if any(t in low for t in ("cancel", "cancellation", "churn", "retention")):
+        return "retention_health"
+    if any(t in low for t in ("pipeline", "contract value", "active pipeline", "revenue", "booking")):
+        return "sales_pipeline"
+    if "sales" in low and "sales rep" not in low and "salesrep" not in low.replace(" ", ""):
+        return "sales_pipeline"
+    if "team" in low and "setter" not in low:
+        return "team_performance"
+    if any(t in low for t in ("setter", "door", "knock", "appointment", "sit down", "sitdown", "manager")):
+        return "field_ops"
+    if any(t in low for t in ("clean deal", "deal quality", "portfolio")):
+        return "deal_quality"
+    if any(t in low for t in ("sales rep", "rep ", " rep", "closer", "performance")):
+        return "rep_performance"
+    return None
+
+
+def _mentions_this_and_last_month(low: str) -> bool:
+    has_this = any(
+        p in low
+        for p in (
+            "this month",
+            "current month",
+            "month to date",
+            " month-to-date",
+            "mtd",
+            "so far this month",
+        )
     )
-    if any(token in text for token in dashboard_signals):
-        return InsightMessage.IntentLabel.DASHBOARD_QUERY
+    has_last = "last month" in low or "previous month" in low or "prior month" in low
+    if has_this and has_last:
+        return True
+    if has_last and ("compare" in low or " vs " in low or " versus " in low or " against " in low):
+        return "month" in low or "mtd" in low
+    return False
 
-    smalltalk_signals = ("hi", "hello", "hey", "good morning", "good evening", "thanks", "thank you")
-    if any(text.startswith(token) for token in smalltalk_signals):
-        return InsightMessage.IntentLabel.GREETING_SMALLTALK
 
-    return InsightMessage.IntentLabel.OUT_OF_SCOPE
+def _mentions_this_and_last_week(low: str) -> bool:
+    has_this = "this week" in low or "week to date" in low or "wtd" in low or "so far this week" in low
+    has_last = "last week" in low or "previous week" in low
+    if has_this and has_last:
+        return True
+    if has_last and ("compare" in low or " vs " in low or " versus " in low):
+        return "week" in low or "wtd" in low
+    return False
+
+
+def _extract_conversation_filters(
+    message: str,
+    existing_filters: dict[str, Any],
+    session_state: dict[str, Any] | None = None,
+    *,
+    today: date | None = None,
+) -> dict[str, Any]:
+    """
+    Phase 1.5: infer date windows and light topic hints from natural language.
+    Does not replace dimension filters (team/installer) from the request UI.
+    """
+    today = today or _today_in_app_tz()
+    low = (message or "").lower().strip()
+    session_state = session_state or {}
+    out: dict[str, Any] = {
+        "date_from": None,
+        "date_to": None,
+        "comparison": None,
+        "active_timeframe": None,
+        "active_topic": _infer_active_topic(message),
+        "human_window": None,
+        "temporal_matched": False,
+    }
+
+    def mark(df: date, dt: date, tf_id: str) -> None:
+        out["date_from"] = df
+        out["date_to"] = dt
+        out["active_timeframe"] = tf_id
+        out["human_window"] = _human_date_window(df, dt)
+        out["temporal_matched"] = True
+
+    # --- Comparisons (check before single-window phrases) ---
+    if _mentions_this_and_last_month(low):
+        a0, a1 = _first_day_of_month(today), today
+        b0, b1 = _last_calendar_month_range(today)
+        out["comparison"] = {"date_from": b0, "date_to": b1, "label": "last_month", "human_window": _human_date_window(b0, b1)}
+        mark(a0, a1, "this_month_vs_last_month")
+        return out
+
+    if _mentions_this_and_last_week(low):
+        mon = _weekday_monday(today)
+        prev_mon = mon - timedelta(days=7)
+        prev_end = mon - timedelta(days=1)
+        out["comparison"] = {
+            "date_from": prev_mon,
+            "date_to": prev_end,
+            "label": "last_week",
+            "human_window": _human_date_window(prev_mon, prev_end),
+        }
+        mark(mon, today, "this_week_vs_last_week")
+        return out
+
+    # --- Single-window phrases (order: specific → broad) ---
+    if re.search(r"\b(yesterday)\b", low):
+        mark(today - timedelta(days=1), today - timedelta(days=1), "yesterday")
+        return out
+
+    if re.search(r"\b(last|past)\s+7\s+days?\b", low):
+        mark(today - timedelta(days=6), today, "last_7_days")
+        return out
+
+    if re.search(r"\b(last|past)\s+30\s+days?\b", low) or "rolling 30" in low:
+        mark(today - timedelta(days=29), today, "last_30_days")
+        return out
+
+    if (
+        re.search(r"\b(this week|week to date|wtd|so far this week)\b", low)
+        or "week so far" in low
+    ):
+        mark(_weekday_monday(today), today, "this_week")
+        return out
+
+    if "last week" in low or "previous week" in low:
+        mon = _weekday_monday(today)
+        start = mon - timedelta(days=7)
+        end = mon - timedelta(days=1)
+        mark(start, end, "last_week")
+        return out
+
+    if (
+        re.search(r"\b(this month|current month|month to date|mtd|so far this month)\b", low)
+        or "month so far" in low
+        or ("month" in low and "only" in low and ("this" in low or "current" in low))
+        or ("filter" in low and "this month" in low)
+    ):
+        mark(_first_day_of_month(today), today, "this_month")
+        return out
+
+    if "last month" in low or "previous month" in low or "prior month" in low:
+        s, e = _last_calendar_month_range(today)
+        mark(s, e, "last_month")
+        return out
+
+    if re.search(r"\b(year to date|ytd)\b", low):
+        mark(date(today.year, 1, 1), today, "ytd")
+        return out
+
+    if re.search(r"\b(last quarter|previous quarter)\b", low):
+        s, e = _previous_calendar_quarter_range(today)
+        mark(s, e, "last_quarter")
+        return out
+
+    m = re.search(r"\bq([1-4])\b(?:\s*,?\s*(\d{4}))?", low)
+    if m:
+        q = int(m.group(1))
+        year = int(m.group(2)) if m.group(2) else today.year
+        s, e = _quarter_range(year, q)
+        if s > today:
+            year -= 1
+            s, e = _quarter_range(year, q)
+        mark(s, e, f"Q{q}_{year}")
+        return out
+
+    # Explicit ISO-ish dates in message (light): "from 2025-01-01" — skip for Phase 1.5 complexity
+
+    return out
+
+
+def _resolve_effective_chat_dates(
+    extraction: dict[str, Any],
+    session_state: dict[str, Any],
+    base_from,
+    base_to,
+) -> tuple[Any, Any, dict[str, Any]]:
+    """Pick primary date window: new utterance beats session sticky beats request/conversation."""
+    trace: dict[str, Any] = {"source": "request_or_conversation", "utterance_override": False}
+    if extraction.get("temporal_matched") and extraction.get("date_from") and extraction.get("date_to"):
+        trace["source"] = "utterance"
+        trace["utterance_override"] = True
+        return extraction["date_from"], extraction["date_to"], trace
+    sf = session_state.get("effective_date_from")
+    st = session_state.get("effective_date_to")
+    if sf and st:
+        try:
+            trace["source"] = "session_sticky"
+            return date.fromisoformat(str(sf)), date.fromisoformat(str(st)), trace
+        except ValueError:
+            pass
+    return base_from, base_to, trace
+
+
+def _continuity_block_for_llm(session_state: dict[str, Any]) -> dict[str, Any] | None:
+    if not session_state:
+        return None
+    block: dict[str, Any] = {}
+    if session_state.get("active_timeframe"):
+        block["prior_active_timeframe"] = session_state.get("active_timeframe")
+    if session_state.get("active_topic"):
+        block["prior_active_topic"] = session_state.get("active_topic")
+    if session_state.get("last_human_window"):
+        block["prior_window_human"] = session_state.get("last_human_window")
+    return block or None
+
+
+def _persist_chat_session_state(
+    conversation: InsightConversation,
+    *,
+    extraction: dict[str, Any],
+    eff_from,
+    eff_to,
+    date_trace: dict[str, Any],
+) -> None:
+    snap: dict[str, Any] = dict(conversation.scope_snapshot or {})
+    prev = snap.get("chat_session") if isinstance(snap.get("chat_session"), dict) else {}
+    ch: dict[str, Any] = {
+        "active_timeframe": extraction.get("active_timeframe") or prev.get("active_timeframe"),
+        "active_topic": extraction.get("active_topic") or prev.get("active_topic"),
+        "last_human_window": extraction.get("human_window") or prev.get("last_human_window"),
+        "last_date_source": date_trace.get("source"),
+    }
+    if eff_from is not None and eff_to is not None:
+        ch["effective_date_from"] = str(eff_from)
+        ch["effective_date_to"] = str(eff_to)
+    else:
+        ch["effective_date_from"] = prev.get("effective_date_from")
+        ch["effective_date_to"] = prev.get("effective_date_to")
+    if extraction.get("comparison"):
+        c = extraction["comparison"]
+        ch["last_comparison"] = {
+            "label": c.get("label"),
+            "date_from": str(c.get("date_from")) if c.get("date_from") else None,
+            "date_to": str(c.get("date_to")) if c.get("date_to") else None,
+        }
+    snap["chat_session"] = ch
+    conversation.scope_snapshot = snap
+    if eff_from is not None and eff_to is not None:
+        conversation.date_from = eff_from
+        conversation.date_to = eff_to
+    conversation.save(update_fields=["scope_snapshot", "date_from", "date_to", "updated_at"])
+
+
+def _slim_overview_for_compare(ov: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "totalProjects": ov.get("totalProjects"),
+        "activeProjects": ov.get("activeProjects"),
+        "cancelledProjects": ov.get("cancelledProjects"),
+        "cleanDealPct": ov.get("cleanDealPct"),
+        "cancellationRate": ov.get("cancellationRate"),
+        "netRetentionRate": ov.get("netRetentionRate"),
+        "activePipelineValue": ov.get("activePipelineValue"),
+    }
 
 
 def _detect_dashboard_scope(message: str) -> str:
     text = message.lower()
-    if any(token in text for token in ("manager performance", "manager", "sit down", "closing rate", "door stats")):
+    # Clean vs non-clean + cancellation compares portfolio buckets (not generic cancellation list).
+    if "clean" in text and any(
+        token in text for token in ("cancel", "cancellation", "churn", "versus", " vs ", "ratio", "non-clean", "non clean")
+    ):
+        return "clean_deals"
+    if any(token in text for token in ("manager performance", "door stats")):
+        return "manager"
+    if re.search(r"\b(managers?)\b", text) and any(
+        token in text
+        for token in (
+            "sit down",
+            "qualified sit down",
+            "closing rate",
+            "performance",
+            "appointment",
+            "rep",
+            "team",
+            "show",
+        )
+    ):
+        return "manager"
+    if re.search(r"\b(managers?)\b", text):
         return "manager"
     if any(token in text for token in ("outcome pending", "pending outcome", "pending deals", "pending")):
         return "outcome_pending"
@@ -752,9 +1217,25 @@ def _detect_dashboard_scope(message: str) -> str:
         return "retention"
     if any(token in text for token in ("cx", "customer experience", "review", "installer", "testimonial")):
         return "cx"
-    if any(token in text for token in ("rep", "team", "sales", "performance", "manager")):
+    if any(
+        token in text
+        for token in (
+            "rep",
+            "team",
+            "sales",
+            "performance",
+            "setter",
+            "closer",
+            "sit down",
+            "qualified sit down",
+            "appointment",
+            "doors",
+            "knock",
+            "closing rate",
+        )
+    ):
         return "performance"
-    if any(token in text for token in ("clean deal", "clean", "deal quality")):
+    if any(token in text for token in ("clean deal", "clean deals", "deal quality")):
         return "clean_deals"
     if any(token in text for token in ("pipeline", "revenue", "contract", "overview", "summary", "dashboard")):
         return "executive_overview"
@@ -800,60 +1281,490 @@ def _detect_metric_hint(message: str, scope: str | None) -> str | None:
     return None
 
 
-def _gather_chat_context(scope: str, date_from, date_to, user, metric_hint: str | None = None) -> dict[str, Any]:
+def _shape_clean_deal_portfolio_for_chat(analysis: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Aggregate clean vs not-clean cancellation for LLM context."""
+    out: list[dict[str, Any]] = []
+    for row in analysis:
+        if not isinstance(row, dict):
+            continue
+        total = int(row.get("total") or 0)
+        cancelled = int(row.get("cancelled") or 0)
+        is_clean = bool(row.get("isCleanDeal"))
+        out.append(
+            {
+                "bucket": "clean" if is_clean else "not_clean",
+                "label": "clean deals" if is_clean else "not clean deals",
+                "totalProjects": total,
+                "cancelledProjects": cancelled,
+                "cancellationRatePct": round(100.0 * cancelled / total, 1) if total else 0.0,
+            }
+        )
+    return out
+
+
+def _gather_chat_context(
+    scope: str,
+    date_from,
+    date_to,
+    user,
+    metric_hint: str | None = None,
+    *,
+    installer=None,
+    sales_team=None,
+    lead_source=None,
+    project_manager=None,
+    market=None,
+    rep_kind=None,
+    rep_name=None,
+    message: str | None = None,
+    matched_vocab_hits: list[str] | None = None,
+) -> dict[str, Any]:
+    dim_kw = dict(
+        installer=installer,
+        sales_team=sales_team,
+        lead_source=lead_source,
+        project_manager=project_manager,
+        market=market,
+        rep_kind=rep_kind,
+        rep_name=rep_name,
+    )
     context: dict[str, Any] = {
-        "overview": get_overview_metrics(date_from, date_to, user),
+        "overview": get_overview_metrics(date_from, date_to, user, **dim_kw),
     }
     if scope == "performance":
-        perf = get_performance_bundle(date_from, date_to, user)
-        context["repPerformance"] = (perf.get("reps") or [])[:12]
+        perf = get_performance_bundle(date_from, date_to, user, **dim_kw)
+        reps_all = perf.get("reps") or []
+        context["repPerformance"] = reps_all[:12]
         context["teamPerformance"] = (perf.get("teams") or [])[:12]
+        hits = matched_vocab_hits or []
+        msg_l = (message or "").lower()
+        if hits:
+            hit_set = {h.strip().lower() for h in hits if str(h).strip()}
+            focus_reps = [r for r in reps_all if str(r.get("salesRep") or "").strip().lower() in hit_set]
+            if not focus_reps:
+                focus_reps = [
+                    r for r in reps_all if any(h in str(r.get("salesRep") or "").lower() for h in hit_set)
+                ]
+            if focus_reps:
+                context["repPerformanceFocus"] = focus_reps[:6]
+        if hits or "setter" in msg_l or "appointment" in msg_l:
+            try:
+                role = get_role_performance_bundle(date_from, date_to, user, **dim_kw)
+                setters = role.get("setters") or []
+                if hits:
+                    hit_set = {h.strip().lower() for h in hits if str(h).strip()}
+                    focus_s = [s for s in setters if str(s.get("agent") or "").strip().lower() in hit_set]
+                    if not focus_s:
+                        focus_s = [
+                            s for s in setters if any(h in str(s.get("agent") or "").lower() for h in hit_set)
+                        ]
+                    if focus_s:
+                        context["setterPerformanceFocus"] = focus_s[:4]
+                if not context.get("setterPerformanceFocus") and (
+                    "setter" in msg_l or "appointment" in msg_l
+                ):
+                    context["setterPerformanceSample"] = sorted(
+                        setters, key=lambda x: -int(x.get("appointments") or 0)
+                    )[:10]
+            except Exception as exc:
+                logger.warning("role performance bundle for chat failed: %s", exc)
     elif scope == "retention":
-        retention = get_retention_bundle(date_from, date_to, user)
+        retention = get_retention_bundle(date_from, date_to, user, **dim_kw)
         context["retentionByRep"] = (retention.get("byRep") or [])[:12]
         context["retentionByLeadSource"] = (retention.get("byLeadSource") or [])[:16]
-        context["cancellationReasons"] = get_cancellation_reasons_breakdown(date_from, date_to, user)[:12]
-        context["onHoldReasons"] = get_on_hold_reasons_breakdown(date_from, date_to, user)[:12]
+        context["cancellationReasons"] = get_cancellation_reasons_breakdown(date_from, date_to, user, **dim_kw)[:12]
+        context["onHoldReasons"] = get_on_hold_reasons_breakdown(date_from, date_to, user, **dim_kw)[:12]
     elif scope == "cx":
-        cx = get_cx_bundle(date_from, date_to, user)
+        cx = get_cx_bundle(date_from, date_to, user, **dim_kw)
         context["cxOverview"] = cx.get("overview") or {}
         context["cxByInstaller"] = (cx.get("byInstaller") or [])[:12]
     elif scope == "clean_deals":
-        clean = get_clean_deals_bundle(date_from, date_to, user)
+        clean = get_clean_deals_bundle(date_from, date_to, user, **dim_kw)
         context["cleanDealsByRep"] = (clean.get("byRep") or [])[:12]
+        analysis = clean.get("analysis") or []
+        context["cleanDealPortfolio"] = _shape_clean_deal_portfolio_for_chat(analysis)
     elif scope == "executive_overview":
         if metric_hint == "pipeline_velocity":
-            pipeline = get_pipeline_bundle(date_from, date_to, user)
+            pipeline = get_pipeline_bundle(date_from, date_to, user, **dim_kw)
             velocity_rows = pipeline.get("velocity") or []
             averages = pipeline.get("averages") or {}
             context["pipelineAverages"] = averages
             context["pipelineVelocitySample"] = velocity_rows[:20]
-        context["categoryBreakdown"] = get_category_breakdown(date_from, date_to, user)[:10]
+        context["categoryBreakdown"] = get_category_breakdown(date_from, date_to, user, **dim_kw)[:10]
     elif scope == "manager":
-        manager = get_manager_bundle(date_from, date_to, user)
+        manager = get_manager_bundle(date_from, date_to, user, **dim_kw)
         context["managerOverview"] = manager.get("managerOverview") or {}
-        context["managerRepPerformance"] = (manager.get("repPerformance") or [])[:12]
+        reps_m = manager.get("repPerformance") or []
+        context["managerRepPerformance"] = reps_m[:12]
         context["managerTeamPerformance"] = (manager.get("teamPerformance") or [])[:10]
         context["doorStats"] = manager.get("doorStats") or {}
         context["dealStageBreakdown"] = (manager.get("dealStageBreakdown") or [])[:10]
         context["pendingOutcome"] = (manager.get("pendingOutcome") or [])[:15]
+        hits = matched_vocab_hits or []
+        msg_l = (message or "").lower()
+        if hits:
+            hit_set = {h.strip().lower() for h in hits if str(h).strip()}
+            mf = [r for r in reps_m if str(r.get("salesRep") or "").strip().lower() in hit_set]
+            if not mf:
+                mf = [r for r in reps_m if any(h in str(r.get("salesRep") or "").lower() for h in hit_set)]
+            if mf:
+                context["managerRepPerformanceFocus"] = mf[:6]
+        if hits or "setter" in msg_l or "appointment" in msg_l:
+            try:
+                role = get_role_performance_bundle(date_from, date_to, user, **dim_kw)
+                setters = role.get("setters") or []
+                if hits:
+                    hit_set = {h.strip().lower() for h in hits if str(h).strip()}
+                    focus_s = [s for s in setters if str(s.get("agent") or "").strip().lower() in hit_set]
+                    if not focus_s:
+                        focus_s = [
+                            s for s in setters if any(h in str(s.get("agent") or "").lower() for h in hit_set)
+                        ]
+                    if focus_s:
+                        context["setterPerformanceFocus"] = focus_s[:4]
+            except Exception as exc:
+                logger.warning("role performance bundle for chat (manager scope) failed: %s", exc)
     elif scope == "on_hold_details":
-        on_hold_rows = get_on_hold_projects(date_from, date_to, user).values(
+        on_hold_rows = get_on_hold_projects(date_from, date_to, user, **dim_kw).values(
             "first_name", "last_name", "sales_rep", "sales_team", "on_hold_reason", "job_status", "customer_since"
         )[:25]
-        context["onHoldReasons"] = get_on_hold_reasons_breakdown(date_from, date_to, user)[:12]
+        context["onHoldReasons"] = get_on_hold_reasons_breakdown(date_from, date_to, user, **dim_kw)[:12]
         context["onHoldProjectsSample"] = list(on_hold_rows)
     elif scope == "cancellations":
-        cancelled_rows = get_cancelled_projects(date_from, date_to, user).values(
+        cancelled_rows = get_cancelled_projects(date_from, date_to, user, **dim_kw).values(
             "first_name", "last_name", "sales_rep", "sales_team", "cancellation_reason", "job_status", "customer_since"
         )[:25]
-        context["cancellationReasons"] = get_cancellation_reasons_breakdown(date_from, date_to, user)[:12]
+        context["cancellationReasons"] = get_cancellation_reasons_breakdown(date_from, date_to, user, **dim_kw)[:12]
         context["cancelledProjectsSample"] = list(cancelled_rows)
     elif scope == "outcome_pending":
-        manager = get_manager_bundle(date_from, date_to, user)
+        manager = get_manager_bundle(date_from, date_to, user, **dim_kw)
         context["managerOverview"] = manager.get("managerOverview") or {}
         context["pendingOutcome"] = (manager.get("pendingOutcome") or [])[:20]
     return context
+
+
+def _scored_fuzzy_name_candidates(
+    message: str, vocab: list[str], *, ratio_min: float = 0.82
+) -> list[dict[str, Any]]:
+    """Best fuzzy match score per canonical vocab name (two-token spans vs full name)."""
+    normalized = re.sub(r"[^\w\s]", " ", (message or "").lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    tokens = normalized.split()
+    best: dict[str, float] = {}
+    best_span: dict[str, str] = {}
+    if len(tokens) < 2:
+        return []
+    for i in range(len(tokens) - 1):
+        span = f"{tokens[i]} {tokens[i + 1]}"
+        if len(span) < 6:
+            continue
+        for name in set(vocab):
+            n = str(name).strip().lower()
+            if len(n) < 6:
+                continue
+            r = difflib.SequenceMatcher(None, span, n).ratio()
+            if r < ratio_min:
+                continue
+            if r > best.get(n, 0.0):
+                best[n] = r
+                best_span[n] = span
+    out = [
+        {"canonical_name": name, "score": best[name], "matched_span": best_span[name]}
+        for name in sorted(best, key=lambda k: -best[k])
+    ]
+    return out[:10]
+
+
+def _ambiguous_entities_decision(
+    candidates: list[dict[str, Any]], *, score_gap_max: float = 0.045, min_score: float = 0.82
+) -> list[dict[str, Any]] | None:
+    if len(candidates) < 2:
+        return None
+    if float(candidates[1]["score"]) < min_score:
+        return None
+    if float(candidates[0]["score"]) - float(candidates[1]["score"]) <= score_gap_max:
+        return candidates[:4]
+    return None
+
+
+def _thread_hints_for_pack(
+    conversation: InsightConversation,
+    *,
+    session_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    msgs = list(
+        conversation.messages.filter(deleted_at__isnull=True).order_by("-created_at")[:24]
+    )
+    last_a = next((m for m in msgs if m.role == InsightMessage.Role.ASSISTANT), None)
+    last_u = next((m for m in msgs if m.role == InsightMessage.Role.USER), None)
+    out: dict[str, Any] = {
+        "last_user_preview": ((last_u.content or "").strip()[:500] if last_u else None),
+        "last_assistant_preview": ((last_a.content or "").strip()[:900] if last_a else None),
+    }
+    ss = session_state or {}
+    if ss.get("last_human_window") or ss.get("active_timeframe"):
+        out["session_prior_window"] = ss.get("last_human_window")
+        out["session_prior_timeframe"] = ss.get("active_timeframe")
+    return out
+
+
+def _build_wide_chat_context_pack(
+    *,
+    user,
+    date_from,
+    date_to,
+    message: str,
+    scope_hint: str | None,
+    metric_hint: str | None,
+    vocab_hits: list[str],
+    ambiguous_entities: list[dict[str, Any]] | None,
+    conversation: InsightConversation,
+    installer=None,
+    sales_team=None,
+    lead_source=None,
+    project_manager=None,
+    market=None,
+    rep_kind=None,
+    rep_name=None,
+    requested_window_meta: dict[str, Any] | None = None,
+    comparison_window: dict[str, Any] | None = None,
+    continuity: dict[str, Any] | None = None,
+    prior_session_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Bounded multi-slice context for conversational analytics (Phase 1).
+    `scope_hint` is metadata only; the model chooses relevance from the full pack.
+    """
+    dim_kw = dict(
+        installer=installer,
+        sales_team=sales_team,
+        lead_source=lead_source,
+        project_manager=project_manager,
+        market=market,
+        rep_kind=rep_kind,
+        rep_name=rep_name,
+    )
+    rw_meta = requested_window_meta or {}
+    requested_window = {
+        "date_from": str(date_from) if date_from else None,
+        "date_to": str(date_to) if date_to else None,
+        "timeframe_id": rw_meta.get("timeframe_id"),
+        "human_label": rw_meta.get("human_window") or (date_from and date_to and _human_date_window(date_from, date_to)),
+        "source": rw_meta.get("source"),
+    }
+
+    comp_block: dict[str, Any] | None = None
+    if comparison_window and comparison_window.get("date_from") and comparison_window.get("date_to"):
+        c0, c1 = comparison_window["date_from"], comparison_window["date_to"]
+        cov = get_overview_metrics(c0, c1, user, **dim_kw)
+        comp_block = {
+            "label": comparison_window.get("label"),
+            "date_from": str(c0),
+            "date_to": str(c1),
+            "human_label": comparison_window.get("human_window") or _human_date_window(c0, c1),
+            "overview": _slim_overview_for_compare(cov),
+        }
+
+    ov = get_overview_metrics(date_from, date_to, user, **dim_kw)
+    perf = get_performance_bundle(date_from, date_to, user, **dim_kw)
+    reps_all = perf.get("reps") or []
+    teams_slice = (perf.get("teams") or [])[:8]
+
+    setters_sample: list[dict[str, Any]] = []
+    setters_all: list[dict[str, Any]] = []
+    try:
+        role_bundle = get_role_performance_bundle(date_from, date_to, user, **dim_kw)
+        setters_all = list(role_bundle.get("setters") or [])
+        setters_sample = sorted(setters_all, key=lambda x: -int(x.get("appointments") or 0))[:15]
+    except Exception as exc:
+        logger.warning("wide pack: role performance bundle failed: %s", exc)
+
+    clean = get_clean_deals_bundle(date_from, date_to, user, **dim_kw)
+    portfolio = _shape_clean_deal_portfolio_for_chat(clean.get("analysis") or [])
+
+    retention = get_retention_bundle(date_from, date_to, user, **dim_kw)
+    by_rep_ret = retention.get("byRep") or []
+    retention_top: list[dict[str, Any]] = []
+    for row in sorted(by_rep_ret, key=lambda r: float(r.get("netRetentionRate") or 0.0), reverse=True)[:6]:
+        retention_top.append(
+            {
+                "sales_rep": str(row.get("sales_rep") or row.get("salesRep") or ""),
+                "totalProjects": int(row.get("totalProjects") or 0),
+                "cancellationRate": float(row.get("cancellationRate") or 0.0),
+                "netRetentionRate": float(row.get("netRetentionRate") or 0.0),
+            }
+        )
+
+    cancel_reasons = get_cancellation_reasons_breakdown(date_from, date_to, user, **dim_kw)[:8]
+
+    hit_set = {h.strip().lower() for h in (vocab_hits or []) if str(h).strip()}
+    rep_focus: list[dict[str, Any]] = []
+    setter_focus: list[dict[str, Any]] = []
+    if hit_set and not ambiguous_entities:
+        rep_focus = [r for r in reps_all if str(r.get("salesRep") or "").strip().lower() in hit_set]
+        if not rep_focus:
+            rep_focus = [
+                r for r in reps_all if any(h in str(r.get("salesRep") or "").lower() for h in hit_set)
+            ]
+        rep_focus = rep_focus[:6]
+        for s in setters_all:
+            ag = str(s.get("agent") or "").strip().lower()
+            if ag in hit_set or any(h in ag for h in hit_set):
+                setter_focus.append(s)
+        if not setter_focus:
+            setter_focus = [
+                s for s in setters_all if any(h in str(s.get("agent") or "").lower() for h in hit_set)
+            ]
+        setter_focus = setter_focus[:5]
+
+    hints = _thread_hints_for_pack(conversation, session_state=prior_session_state)
+
+    pack: dict[str, Any] = {
+        "pack_version": "wide-v2",
+        "scope_hint": scope_hint or "executive_overview",
+        "metric_hint": metric_hint,
+        "requested_window": requested_window,
+        "overview": ov,
+        "rep_performance_sample": reps_all[:18],
+        "team_performance_sample": teams_slice,
+        "setter_role_metrics_sample": setters_sample,
+        "rep_focus": rep_focus,
+        "setter_role_metrics_focus": setter_focus,
+        "clean_deal_portfolio": portfolio,
+        "retention_headline": {"top_reps_by_net_retention": retention_top},
+        "cancellation_summary": {
+            "overview_cancellation_rate_pct": float(ov.get("cancellationRate") or 0.0),
+            "top_cancellation_reasons": [
+                {"reason": str(r.get("reason") or ""), "count": int(r.get("count") or 0)} for r in cancel_reasons
+            ],
+        },
+        "ambiguous_entities": ambiguous_entities,
+        "thread_hints": hints,
+    }
+    if comp_block:
+        pack["comparison_window"] = comp_block
+    if continuity:
+        pack["continuity"] = continuity
+    return pack
+
+
+def _filter_wide_pack_for_llm(pack: dict[str, Any]) -> dict[str, Any]:
+    """Slim wide pack for token control while keeping cross-domain signals."""
+    out: dict[str, Any] = {
+        "shape_version": "v4-wide-llm",
+        "pack_version": pack.get("pack_version"),
+        "scope_hint": pack.get("scope_hint"),
+        "metric_hint": pack.get("metric_hint"),
+    }
+    ov = pack.get("overview") or {}
+    out["overview"] = {
+        "totalProjects": ov.get("totalProjects"),
+        "activeProjects": ov.get("activeProjects"),
+        "cancelledProjects": ov.get("cancelledProjects"),
+        "onHoldProjects": ov.get("onHoldProjects"),
+        "cleanDeals": ov.get("cleanDeals"),
+        "cleanDealPct": ov.get("cleanDealPct"),
+        "cancellationRate": ov.get("cancellationRate"),
+        "netRetentionRate": ov.get("netRetentionRate"),
+        "activePipelineValue": ov.get("activePipelineValue"),
+    }
+    out["rep_performance_sample"] = [
+        {
+            "salesRep": r.get("salesRep"),
+            "salesTeam": r.get("salesTeam"),
+            "totalProjects": int(r.get("totalProjects") or 0),
+            "cleanDealPct": float(r.get("cleanDealPct") or 0.0),
+            "cancellationRate": float(r.get("cancellationRate") or 0.0),
+            "netRetentionRate": float(r.get("netRetentionRate") or 0.0),
+        }
+        for r in (pack.get("rep_performance_sample") or [])[:14]
+    ]
+    out["team_performance_sample"] = [
+        {
+            "salesTeam": r.get("salesTeam"),
+            "totalProjects": int(r.get("totalProjects") or 0),
+            "cleanDealPct": float(r.get("cleanDealPct") or 0.0),
+            "cancellationRate": float(r.get("cancellationRate") or 0.0),
+        }
+        for r in (pack.get("team_performance_sample") or [])[:8]
+    ]
+    setter_rows = pack.get("setter_role_metrics_sample") or []
+    out["setter_role_metrics_sample"] = [
+        {
+            "agent": r.get("agent"),
+            "allDoors": int(r.get("allDoors") or 0),
+            "contactsMade": int(r.get("contactsMade") or 0),
+            "appointments": int(r.get("appointments") or 0),
+            "sitdowns": int(r.get("sitdowns") or 0),
+            "qfdSitdowns": int(r.get("qfdSitdowns") or 0),
+            "contactRate": float(r.get("contactRate") or 0.0),
+            "apptSchedRatio": float(r.get("apptSchedRatio") or 0.0),
+            "sitDownRate": float(r.get("sitDownRate") or 0.0),
+            "cancellationRate": float(r.get("cancellationRate") or 0.0),
+        }
+        for r in setter_rows[:12]
+    ]
+    rep_f = pack.get("rep_focus") or []
+    out["rep_focus"] = [
+        {
+            "salesRep": r.get("salesRep"),
+            "salesTeam": r.get("salesTeam"),
+            "totalProjects": int(r.get("totalProjects") or 0),
+            "cleanDealPct": float(r.get("cleanDealPct") or 0.0),
+            "cancellationRate": float(r.get("cancellationRate") or 0.0),
+            "netRetentionRate": float(r.get("netRetentionRate") or 0.0),
+        }
+        for r in rep_f[:5]
+    ]
+    set_f = pack.get("setter_role_metrics_focus") or []
+    out["setter_role_metrics_focus"] = [
+        {
+            "agent": r.get("agent"),
+            "allDoors": int(r.get("allDoors") or 0),
+            "contactsMade": int(r.get("contactsMade") or 0),
+            "appointments": int(r.get("appointments") or 0),
+            "sitdowns": int(r.get("sitdowns") or 0),
+            "qfdSitdowns": int(r.get("qfdSitdowns") or 0),
+            "contactRate": float(r.get("contactRate") or 0.0),
+            "apptSchedRatio": float(r.get("apptSchedRatio") or 0.0),
+            "sitDownRate": float(r.get("sitDownRate") or 0.0),
+            "cancellationRate": float(r.get("cancellationRate") or 0.0),
+        }
+        for r in set_f[:5]
+    ]
+    out["clean_deal_portfolio"] = pack.get("clean_deal_portfolio") or []
+    rh = pack.get("retention_headline") or {}
+    out["retention_headline"] = {
+        "top_reps_by_net_retention": (rh.get("top_reps_by_net_retention") or [])[:6],
+    }
+    cs = pack.get("cancellation_summary") or {}
+    out["cancellation_summary"] = {
+        "overview_cancellation_rate_pct": cs.get("overview_cancellation_rate_pct"),
+        "top_cancellation_reasons": (cs.get("top_cancellation_reasons") or [])[:6],
+    }
+    amb = pack.get("ambiguous_entities")
+    if amb:
+        out["ambiguous_entities"] = amb
+    rw = pack.get("requested_window")
+    if rw:
+        out["requested_window"] = rw
+    cw = pack.get("comparison_window")
+    if cw:
+        out["comparison_window"] = cw
+    cont = pack.get("continuity")
+    if cont:
+        out["continuity"] = cont
+    th = pack.get("thread_hints") or {}
+    th_out: dict[str, Any] = {}
+    if th.get("last_user_preview") or th.get("last_assistant_preview"):
+        th_out["last_user_preview"] = th.get("last_user_preview")
+        th_out["last_assistant_preview"] = th.get("last_assistant_preview")
+    if th.get("session_prior_window") or th.get("session_prior_timeframe"):
+        th_out["session_prior_window"] = th.get("session_prior_window")
+        th_out["session_prior_timeframe"] = th.get("session_prior_timeframe")
+    if th_out:
+        out["thread_hints"] = th_out
+    return out
 
 
 def _filter_context_for_llm(shaped_context: dict[str, Any] | None, scope: str | None, metric_hint: str | None) -> dict[str, Any] | None:
@@ -928,6 +1839,37 @@ def _filter_context_for_llm(shaped_context: dict[str, Any] | None, scope: str | 
                 }
                 for row in (shaped_context.get("team_breakdown") or [])[:8]
             ]
+        focus_reps = shaped_context.get("rep_performance_focus") or []
+        if focus_reps:
+            filtered["rep_focus"] = [
+                {
+                    "sales_rep": _rep_name(row),
+                    "totalProjects": int(row.get("totalProjects") or 0),
+                    "cleanDealPct": float(row.get("cleanDealPct") or 0.0),
+                    "cancellationRate": float(row.get("cancellationRate") or 0.0),
+                    "netRetentionRate": float(row.get("netRetentionRate") or 0.0),
+                }
+                for row in focus_reps[:4]
+            ]
+        setter_focus = shaped_context.get("setter_performance_focus") or []
+        setter_sample = shaped_context.get("setter_performance_sample") or []
+        setter_rows = setter_focus if setter_focus else setter_sample
+        if setter_rows:
+            filtered["setter_role_metrics"] = [
+                {
+                    "agent": row.get("agent"),
+                    "allDoors": int(row.get("allDoors") or 0),
+                    "contactsMade": int(row.get("contactsMade") or 0),
+                    "appointments": int(row.get("appointments") or 0),
+                    "sitdowns": int(row.get("sitdowns") or 0),
+                    "qfdSitdowns": int(row.get("qfdSitdowns") or 0),
+                    "contactRate": float(row.get("contactRate") or 0.0),
+                    "apptSchedRatio": float(row.get("apptSchedRatio") or 0.0),
+                    "sitDownRate": float(row.get("sitDownRate") or 0.0),
+                    "cancellationRate": float(row.get("cancellationRate") or 0.0),
+                }
+                for row in setter_rows[:8]
+            ]
     elif scope == "cx":
         filtered["cx_overview"] = shaped_context.get("cx_overview") or {}
         filtered["cx_by_installer"] = [
@@ -939,6 +1881,7 @@ def _filter_context_for_llm(shaped_context: dict[str, Any] | None, scope: str | 
             for row in (shaped_context.get("cx_by_installer") or [])[:6]
         ]
     elif scope == "clean_deals":
+        filtered["clean_deal_portfolio"] = shaped_context.get("clean_deal_portfolio") or []
         filtered["clean_deals_by_rep"] = [
             {
                 "sales_rep": _rep_name(row),
@@ -1009,6 +1952,37 @@ def _filter_context_for_llm(shaped_context: dict[str, Any] | None, scope: str | 
         filtered["deal_stage_breakdown"] = (shaped_context.get("deal_stage_breakdown") or [])[:8]
         if metric_hint in ("pending_outcome", "manager_overview", None):
             filtered["pending_outcome"] = (shaped_context.get("pending_outcome") or [])[:10]
+        mgr_focus = shaped_context.get("manager_rep_performance_focus") or []
+        if mgr_focus:
+            filtered["manager_rep_focus"] = [
+                {
+                    "salesRep": row.get("salesRep"),
+                    "salesTeam": row.get("salesTeam"),
+                    "totalAppointments": row.get("totalAppointments"),
+                    "closedDeals": row.get("closedDeals"),
+                    "cancelledDeals": row.get("cancelledDeals"),
+                    "sitDownRate": row.get("sitDownRate"),
+                    "closingRate": row.get("closingRate"),
+                }
+                for row in mgr_focus[:6]
+            ]
+        setter_focus_m = shaped_context.get("setter_performance_focus") or []
+        if setter_focus_m:
+            filtered["setter_role_metrics"] = [
+                {
+                    "agent": row.get("agent"),
+                    "allDoors": int(row.get("allDoors") or 0),
+                    "contactsMade": int(row.get("contactsMade") or 0),
+                    "appointments": int(row.get("appointments") or 0),
+                    "sitdowns": int(row.get("sitdowns") or 0),
+                    "qfdSitdowns": int(row.get("qfdSitdowns") or 0),
+                    "contactRate": float(row.get("contactRate") or 0.0),
+                    "apptSchedRatio": float(row.get("apptSchedRatio") or 0.0),
+                    "sitDownRate": float(row.get("sitDownRate") or 0.0),
+                    "cancellationRate": float(row.get("cancellationRate") or 0.0),
+                }
+                for row in setter_focus_m[:6]
+            ]
     elif scope == "on_hold_details":
         filtered["on_hold_reasons"] = (shaped_context.get("on_hold_reasons") or [])[:8]
         filtered["on_hold_projects_sample"] = [
@@ -1056,10 +2030,18 @@ def _shape_dashboard_context(raw: dict[str, Any], scope: str) -> dict[str, Any]:
     }
     if raw.get("repPerformance"):
         shaped["rep_breakdown"] = (raw.get("repPerformance") or [])[:10]
+    if raw.get("repPerformanceFocus"):
+        shaped["rep_performance_focus"] = (raw.get("repPerformanceFocus") or [])[:6]
+    if raw.get("setterPerformanceFocus"):
+        shaped["setter_performance_focus"] = (raw.get("setterPerformanceFocus") or [])[:6]
+    if raw.get("setterPerformanceSample"):
+        shaped["setter_performance_sample"] = (raw.get("setterPerformanceSample") or [])[:12]
     if raw.get("teamPerformance"):
         shaped["team_breakdown"] = (raw.get("teamPerformance") or [])[:10]
     if raw.get("cleanDealsByRep"):
         shaped["clean_deals_by_rep"] = (raw.get("cleanDealsByRep") or [])[:10]
+    if raw.get("cleanDealPortfolio"):
+        shaped["clean_deal_portfolio"] = raw.get("cleanDealPortfolio") or []
     if raw.get("retentionByRep"):
         shaped["retention_by_rep"] = (raw.get("retentionByRep") or [])[:10]
     if raw.get("retentionByLeadSource"):
@@ -1082,6 +2064,8 @@ def _shape_dashboard_context(raw: dict[str, Any], scope: str) -> dict[str, Any]:
         shaped["manager_overview"] = raw.get("managerOverview") or {}
     if raw.get("managerRepPerformance"):
         shaped["manager_rep_performance"] = (raw.get("managerRepPerformance") or [])[:10]
+    if raw.get("managerRepPerformanceFocus"):
+        shaped["manager_rep_performance_focus"] = (raw.get("managerRepPerformanceFocus") or [])[:6]
     if raw.get("managerTeamPerformance"):
         shaped["manager_team_performance"] = (raw.get("managerTeamPerformance") or [])[:10]
     if raw.get("doorStats"):
@@ -1114,24 +2098,51 @@ def _build_context_meta(
         "record_count": 0,
     }
     if shaped_context:
-        rep_count = len(shaped_context.get("rep_breakdown") or [])
-        team_count = len(shaped_context.get("team_breakdown") or [])
-        lead_count = len(shaped_context.get("retention_by_lead_source") or [])
-        cancel_count = len(shaped_context.get("cancellation_reasons") or [])
-        cx_count = len(shaped_context.get("cx_by_installer") or [])
-        meta.update(
-            {
-                "context_type": "dashboard_summary",
-                "shape_version": shaped_context.get("shape_version"),
-                "record_count": rep_count + team_count + lead_count + cancel_count + cx_count,
-                "data_scope": data_scope or shaped_context.get("scope") or "overview",
-            }
-        )
+        if shaped_context.get("shape_version") == "v4-wide-llm":
+            n = 0
+            for k in (
+                "rep_performance_sample",
+                "setter_role_metrics_sample",
+                "rep_focus",
+                "setter_role_metrics_focus",
+            ):
+                v = shaped_context.get(k)
+                if isinstance(v, list):
+                    n += len(v)
+            rh = shaped_context.get("retention_headline") or {}
+            n += len(rh.get("top_reps_by_net_retention") or [])
+            cs = shaped_context.get("cancellation_summary") or {}
+            n += len(cs.get("top_cancellation_reasons") or [])
+            if shaped_context.get("ambiguous_entities"):
+                n += len(shaped_context["ambiguous_entities"])
+            meta.update(
+                {
+                    "context_type": "wide_pack",
+                    "shape_version": shaped_context.get("shape_version"),
+                    "pack_version": shaped_context.get("pack_version"),
+                    "record_count": n,
+                    "data_scope": data_scope or shaped_context.get("scope_hint") or "wide",
+                }
+            )
+        else:
+            rep_count = len(shaped_context.get("rep_breakdown") or [])
+            team_count = len(shaped_context.get("team_breakdown") or [])
+            lead_count = len(shaped_context.get("retention_by_lead_source") or [])
+            cancel_count = len(shaped_context.get("cancellation_reasons") or [])
+            cx_count = len(shaped_context.get("cx_by_installer") or [])
+            meta.update(
+                {
+                    "context_type": "dashboard_summary",
+                    "shape_version": shaped_context.get("shape_version"),
+                    "record_count": rep_count + team_count + lead_count + cancel_count + cx_count,
+                    "data_scope": data_scope or shaped_context.get("scope") or "overview",
+                }
+            )
     return meta
 
 
 def _history_messages(conversation: InsightConversation) -> list[dict[str, str]]:
-    rows = list(conversation.messages.filter(deleted_at__isnull=True).order_by("-created_at")[:5])
+    rows = list(conversation.messages.filter(deleted_at__isnull=True).order_by("-created_at")[:10])
     rows.reverse()
     return [{"role": row.role, "content": row.content} for row in rows if row.role in {"user", "assistant", "system"}]
 
@@ -1175,6 +2186,8 @@ def _deterministic_cancellation_rep_plan(text: str, intent_label: str, data_scop
         return None
 
     normalized = _normalize_question(text)
+    if _message_prefers_llm_narrative(text):
+        return None
     cancel_terms = (
         "cancel",
         "cancelled",
@@ -1213,6 +2226,35 @@ def _deterministic_cancellation_rep_plan(text: str, intent_label: str, data_scop
     }
 
 
+def _message_prefers_llm_narrative(text: str) -> bool:
+    """
+    Long coaching / summary prompts should hit the LLM with dashboard context,
+    not the deterministic 'top rep' shortcut (which misfires on phrases like
+    'which is the most important').
+    """
+    lowered = (text or "").lower()
+    if len(lowered) > 900:
+        return True
+    cues = (
+        "summarize",
+        "summary",
+        "help me",
+        "ideas",
+        "explain",
+        "what matters",
+        "when it comes to",
+        "walk me through",
+        "kind of",
+        "appointment setter",
+        "things that he",
+        "things she can",
+    )
+    if any(c in lowered for c in cues):
+        return True
+    bulletish = lowered.count("\n-") + lowered.count("\n*") + lowered.count(" - ")
+    return bulletish >= 2 and len(lowered) > 200
+
+
 def _deterministic_rank_plan(
     text: str,
     intent_label: str,
@@ -1224,7 +2266,19 @@ def _deterministic_rank_plan(
     normalized = _normalize_question(text)
     if _requires_explanation(normalized):
         return None
-    if not any(term in normalized for term in ("top", "best", "highest", "most", "lowest", "least", "worst")):
+    if _message_prefers_llm_narrative(text):
+        return None
+    # Avoid treating prose like "which is the most important" as a ranking question.
+    has_superlative = any(term in normalized for term in ("top", "best", "highest", "lowest", "least", "worst"))
+    has_most_ranking = bool(
+        re.search(
+            r"\b(most cancelled|most deals|most appointments|most projects|has the most|with the most|"
+            r"most sit|most closes|highest number|lowest number|"
+            r"who\s+has\s+the\s+most|which\s+\w+\s+has\s+the\s+most)\b",
+            normalized,
+        )
+    )
+    if not (has_superlative or has_most_ranking):
         return None
 
     direction = "max"
@@ -1418,8 +2472,33 @@ def _deterministic_rank_plan(
     return None
 
 
-def _compute_cancellation_rep_result(plan: dict[str, Any], date_from, date_to, user) -> tuple[str, dict[str, Any]] | None:
-    raw_context = _gather_chat_context("retention", date_from, date_to, user)
+def _compute_cancellation_rep_result(
+    plan: dict[str, Any],
+    date_from,
+    date_to,
+    user,
+    *,
+    installer=None,
+    sales_team=None,
+    lead_source=None,
+    project_manager=None,
+    market=None,
+    rep_kind=None,
+    rep_name=None,
+) -> tuple[str, dict[str, Any]] | None:
+    raw_context = _gather_chat_context(
+        "retention",
+        date_from,
+        date_to,
+        user,
+        installer=installer,
+        sales_team=sales_team,
+        lead_source=lead_source,
+        project_manager=project_manager,
+        market=market,
+        rep_kind=rep_kind,
+        rep_name=rep_name,
+    )
     rows = raw_context.get("retentionByRep") or []
     parsed_rows: list[dict[str, Any]] = []
     for row in rows:
@@ -1482,13 +2561,33 @@ def _compute_cancellation_rep_result(plan: dict[str, Any], date_from, date_to, u
     return reply, payload
 
 
-def _compute_deterministic_rank_result(plan: dict[str, Any], date_from, date_to, user) -> tuple[str, dict[str, Any]] | None:
+def _compute_deterministic_rank_result(
+    plan: dict[str, Any],
+    date_from,
+    date_to,
+    user,
+    *,
+    installer=None,
+    sales_team=None,
+    lead_source=None,
+    project_manager=None,
+    market=None,
+    rep_kind=None,
+    rep_name=None,
+) -> tuple[str, dict[str, Any]] | None:
     raw_context = _gather_chat_context(
         plan.get("scope") or "executive_overview",
         date_from,
         date_to,
         user,
         metric_hint=plan.get("metric_hint"),
+        installer=installer,
+        sales_team=sales_team,
+        lead_source=lead_source,
+        project_manager=project_manager,
+        market=market,
+        rep_kind=rep_kind,
+        rep_name=rep_name,
     )
     source_key = str(plan.get("source_key") or "")
     rows = raw_context.get(source_key) or []
@@ -1572,10 +2671,17 @@ def _compute_deterministic_rank_result(plan: dict[str, Any], date_from, date_to,
     return reply, payload
 
 
-def _chat_cache_key(normalized_question: str, scope: str | None, date_from, date_to, plan_signature: str) -> str:
+def _chat_cache_key(
+    normalized_question: str,
+    scope: str | None,
+    date_from,
+    date_to,
+    plan_signature: str,
+    dim_sig: str = "",
+) -> str:
     raw_key = (
         f"{normalized_question}|{scope or 'none'}|{date_from or 'none'}|"
-        f"{date_to or 'none'}|{plan_signature}"
+        f"{date_to or 'none'}|{plan_signature}|{dim_sig or 'nodims'}"
     )
     digest = hashlib.md5(raw_key.encode("utf-8")).hexdigest()
     return f"insights_chat:deterministic:{digest}"
@@ -1629,11 +2735,18 @@ def _compose_chat_messages(
     return messages, rendered_prompt
 
 
-def _chat_response_for_non_dashboard(intent_label: str) -> str | None:
+def _chat_response_for_non_dashboard(
+    intent_label: str, *, safety_flags: dict[str, Any] | None = None
+) -> str | None:
     if intent_label == InsightMessage.IntentLabel.GREETING_SMALLTALK:
         return "Hi! Ask me about Sunbright dashboard metrics like revenue, retention, clean deal rate, or rep/team performance."
     if intent_label == InsightMessage.IntentLabel.OUT_OF_SCOPE:
-        return "I can help with Sunbright analytics questions. Try asking about dashboard performance, trends, retention, or action recommendations."
+        if safety_flags and safety_flags.get("possiblePromptInjection"):
+            return (
+                "I can't follow requests like that. Ask about your Sunbright dashboard metrics, "
+                "teams, retention, or performance instead."
+            )
+        return "I focus on Sunbright analytics here. Ask about performance, retention, clean deals, or your KPIs."
     return None
 
 
@@ -1649,6 +2762,9 @@ def _shape_explanation_fallback(reply: str, user_message: str, shaped_context: d
     reasons = []
     if shaped_context:
         reasons = list((shaped_context.get("top_cancellation_reasons") or [])[:3])
+        if not reasons and shaped_context.get("cancellation_summary"):
+            tr = (shaped_context.get("cancellation_summary") or {}).get("top_cancellation_reasons") or []
+            reasons = [str(r.get("reason") or "") for r in tr[:3] if r.get("reason")]
     reasons_line = ", ".join(reasons) if reasons else "pricing concerns, buyer hesitation, and lead quality variation"
 
     if shaped_context and shaped_context.get("pipeline_averages"):
@@ -1676,8 +2792,31 @@ def chat_with_insights_assistant(
     conversation_id: int | None = None,
     date_from=None,
     date_to=None,
+    sales_team=None,
+    installer=None,
+    lead_source=None,
+    project_manager=None,
+    market=None,
+    rep_kind=None,
+    rep_name=None,
 ) -> dict[str, Any]:
     text = (message or "").strip()
+    dim_sig_parts = []
+    if installer and str(installer).strip():
+        dim_sig_parts.append(f"i:{str(installer).strip().lower()}")
+    if sales_team and str(sales_team).strip():
+        dim_sig_parts.append(f"t:{str(sales_team).strip().lower()}")
+    if lead_source and str(lead_source).strip():
+        dim_sig_parts.append(f"l:{str(lead_source).strip().lower()}")
+    if project_manager and str(project_manager).strip():
+        dim_sig_parts.append(f"p:{str(project_manager).strip().lower()}")
+    if market and str(market).strip():
+        dim_sig_parts.append(f"k:{str(market).strip().lower()}")
+    rk = (rep_kind or "").strip().lower() if rep_kind else ""
+    rn = (rep_name or "").strip() if rep_name else ""
+    if rk in ("sales_rep", "setter") and rn:
+        dim_sig_parts.append(f"r:{rk}:{rn.lower()}")
+    chat_dim_sig = "|".join(sorted(dim_sig_parts)) if dim_sig_parts else ""
     print("[insights-chat] incoming request", {"user_id": getattr(user, "id", None), "conversation_id": conversation_id})
     if not text:
         raise InsightsLLMError("Message cannot be empty.")
@@ -1702,8 +2841,8 @@ def chat_with_insights_assistant(
         )
         print("[insights-chat] created new conversation", {"conversation_id": conversation.id})
 
-    intent_label = _classify_intent(text)
     safety_flags = _detect_safety_flags(text)
+    intent_label = _classify_intent(text, safety_flags=safety_flags)
     print(
         "[insights-chat] classified intent",
         {"intent_label": intent_label, "possible_prompt_injection": safety_flags.get("possiblePromptInjection", False)},
@@ -1715,11 +2854,56 @@ def chat_with_insights_assistant(
     deterministic_hit = False
     cache_hit = False
     llm_used = False
+    session_state0: dict[str, Any] = {}
+    extraction: dict[str, Any] = {}
+    date_trace: dict[str, Any] = {}
+    eff_from = date_from if date_from is not None else conversation.date_from
+    eff_to = date_to if date_to is not None else conversation.date_to
+    continuity = None
+
     if intent_label == InsightMessage.IntentLabel.DASHBOARD_QUERY:
+        snap0 = conversation.scope_snapshot or {}
+        session_state0 = snap0.get("chat_session") if isinstance(snap0.get("chat_session"), dict) else {}
+        base_from = date_from if date_from is not None else conversation.date_from
+        base_to = date_to if date_to is not None else conversation.date_to
+        extraction = _extract_conversation_filters(
+            text,
+            {"date_from": base_from, "date_to": base_to},
+            session_state0,
+        )
+        eff_from, eff_to, date_trace = _resolve_effective_chat_dates(extraction, session_state0, base_from, base_to)
+        continuity = _continuity_block_for_llm(session_state0)
         data_scope = _detect_dashboard_scope(text)
         metric_hint = _detect_metric_hint(text, data_scope)
+        if data_scope == "executive_overview":
+            try:
+                v2 = _load_chat_rep_setter_vocab(
+                    user,
+                    eff_from,
+                    eff_to,
+                    installer=installer,
+                    sales_team=sales_team,
+                    lead_source=lead_source,
+                    project_manager=project_manager,
+                    market=market,
+                    rep_kind=rep_kind,
+                    rep_name=rep_name,
+                )
+                if _message_matches_vocab_name(text, v2):
+                    data_scope = "performance"
+                    metric_hint = metric_hint or "rep_performance"
+            except Exception as exc:
+                logger.warning("insights chat scope assist vocab failed: %s", exc)
         print("[insights-chat] dashboard scope selected", {"scope": data_scope})
-        print("[insights-chat] metric hint", {"metric_hint": metric_hint})
+        print(
+            "[insights-chat] metric hint + dates",
+            {
+                "metric_hint": metric_hint,
+                "eff_from": str(eff_from) if eff_from else None,
+                "eff_to": str(eff_to) if eff_to else None,
+                "date_window_source": date_trace.get("source"),
+            },
+        )
     deterministic_plan = _deterministic_rank_plan(text, intent_label, data_scope, metric_hint)
     if not deterministic_plan:
         deterministic_plan = _deterministic_cancellation_rep_plan(text, intent_label, data_scope)
@@ -1737,9 +2921,10 @@ def chat_with_insights_assistant(
         cache_key = _chat_cache_key(
             normalized_question,
             data_scope,
-            date_from or conversation.date_from,
-            date_to or conversation.date_to,
+            eff_from,
+            eff_to,
             plan_signature,
+            chat_dim_sig,
         )
         cached_payload = cache.get(cache_key)
         if cached_payload:
@@ -1748,12 +2933,21 @@ def chat_with_insights_assistant(
             deterministic_hit = True
             context_meta = _build_context_meta(
                 intent_label,
-                date_from or conversation.date_from,
-                date_to or conversation.date_to,
+                eff_from,
+                eff_to,
                 None,
                 data_scope=data_scope,
             )
             context_meta.update({"deterministic_hit": True, "cache_hit": True, "llm_used": False})
+            if intent_label == InsightMessage.IntentLabel.DASHBOARD_QUERY:
+                context_meta.update(
+                    {
+                        "date_window_source": date_trace.get("source"),
+                        "active_timeframe": extraction.get("active_timeframe") or session_state0.get("active_timeframe"),
+                        "active_topic": extraction.get("active_topic") or session_state0.get("active_topic"),
+                        "utterance_temporal_hit": extraction.get("temporal_matched"),
+                    }
+                )
             user_row = InsightMessage.objects.create(
                 conversation=conversation,
                 role=InsightMessage.Role.USER,
@@ -1771,6 +2965,14 @@ def chat_with_insights_assistant(
                 context_meta=context_meta,
             )
             print("[insights-chat] deterministic_hit", {"deterministic_hit": True, "cache_hit": True, "llm_used": False})
+            if intent_label == InsightMessage.IntentLabel.DASHBOARD_QUERY:
+                _persist_chat_session_state(
+                    conversation,
+                    extraction=extraction,
+                    eff_from=eff_from,
+                    eff_to=eff_to,
+                    date_trace=date_trace,
+                )
             return {
                 "conversationId": conversation.id,
                 "messageId": assistant_row.id,
@@ -1781,16 +2983,30 @@ def chat_with_insights_assistant(
         print("[insights-chat] cache_hit", {"cache_hit": False, "cache_key": cache_key})
         deterministic_result = _compute_deterministic_rank_result(
             deterministic_plan,
-            date_from or conversation.date_from,
-            date_to or conversation.date_to,
+            eff_from,
+            eff_to,
             user,
+            installer=installer,
+            sales_team=sales_team,
+            lead_source=lead_source,
+            project_manager=project_manager,
+            market=market,
+            rep_kind=rep_kind,
+            rep_name=rep_name,
         )
         if deterministic_result is None and deterministic_plan.get("scope") == "retention":
             deterministic_result = _compute_cancellation_rep_result(
                 deterministic_plan,
-                date_from or conversation.date_from,
-                date_to or conversation.date_to,
+                eff_from,
+                eff_to,
                 user,
+                installer=installer,
+                sales_team=sales_team,
+                lead_source=lead_source,
+                project_manager=project_manager,
+                market=market,
+                rep_kind=rep_kind,
+                rep_name=rep_name,
             )
         if deterministic_result:
             deterministic_hit = True
@@ -1802,8 +3018,8 @@ def chat_with_insights_assistant(
             )
             context_meta = _build_context_meta(
                 intent_label,
-                date_from or conversation.date_from,
-                date_to or conversation.date_to,
+                eff_from,
+                eff_to,
                 None,
                 data_scope=data_scope,
             )
@@ -1815,6 +3031,15 @@ def chat_with_insights_assistant(
                     "deterministic_payload": deterministic_payload,
                 }
             )
+            if intent_label == InsightMessage.IntentLabel.DASHBOARD_QUERY:
+                context_meta.update(
+                    {
+                        "date_window_source": date_trace.get("source"),
+                        "active_timeframe": extraction.get("active_timeframe") or session_state0.get("active_timeframe"),
+                        "active_topic": extraction.get("active_topic") or session_state0.get("active_topic"),
+                        "utterance_temporal_hit": extraction.get("temporal_matched"),
+                    }
+                )
             user_row = InsightMessage.objects.create(
                 conversation=conversation,
                 role=InsightMessage.Role.USER,
@@ -1832,6 +3057,14 @@ def chat_with_insights_assistant(
                 context_meta=context_meta,
             )
             print("[insights-chat] deterministic_hit", {"deterministic_hit": True, "cache_hit": False, "llm_used": False})
+            if intent_label == InsightMessage.IntentLabel.DASHBOARD_QUERY:
+                _persist_chat_session_state(
+                    conversation,
+                    extraction=extraction,
+                    eff_from=eff_from,
+                    eff_to=eff_to,
+                    date_trace=date_trace,
+                )
             return {
                 "conversationId": conversation.id,
                 "messageId": assistant_row.id,
@@ -1840,31 +3073,79 @@ def chat_with_insights_assistant(
                 "contextMeta": context_meta,
             }
     if intent_label == InsightMessage.IntentLabel.DASHBOARD_QUERY:
-        raw_context = _gather_chat_context(
-            data_scope or "executive_overview",
-            date_from or conversation.date_from,
-            date_to or conversation.date_to,
+        vocab_bundle = _load_chat_rep_setter_vocab(
             user,
-            metric_hint=metric_hint,
+            eff_from,
+            eff_to,
+            installer=installer,
+            sales_team=sales_team,
+            lead_source=lead_source,
+            project_manager=project_manager,
+            market=market,
+            rep_kind=rep_kind,
+            rep_name=rep_name,
         )
-        broad_context = _shape_dashboard_context(raw_context, data_scope or "executive_overview")
-        shaped_context = _filter_context_for_llm(broad_context, data_scope, metric_hint)
+        scored_names = _scored_fuzzy_name_candidates(text, vocab_bundle)
+        ambiguous_entities = _ambiguous_entities_decision(scored_names)
+        vocab_hits = [] if ambiguous_entities else _vocab_hits_in_message(text, vocab_bundle)
+        human_w = extraction.get("human_window")
+        tf_id = extraction.get("active_timeframe") or session_state0.get("active_timeframe")
+        if not human_w and eff_from and eff_to:
+            human_w = _human_date_window(eff_from, eff_to)
+        req_win_meta = {
+            "timeframe_id": tf_id,
+            "human_window": human_w,
+            "source": date_trace.get("source"),
+        }
+        wide_pack = _build_wide_chat_context_pack(
+            user=user,
+            date_from=eff_from,
+            date_to=eff_to,
+            message=text,
+            scope_hint=data_scope or "executive_overview",
+            metric_hint=metric_hint,
+            vocab_hits=vocab_hits,
+            ambiguous_entities=ambiguous_entities,
+            conversation=conversation,
+            installer=installer,
+            sales_team=sales_team,
+            lead_source=lead_source,
+            project_manager=project_manager,
+            market=market,
+            rep_kind=rep_kind,
+            rep_name=rep_name,
+            requested_window_meta=req_win_meta,
+            comparison_window=extraction.get("comparison"),
+            continuity=continuity,
+            prior_session_state=session_state0,
+        )
+        shaped_context = _filter_wide_pack_for_llm(wide_pack)
         print(
             "[insights-chat] context prepared",
             {
-                "scope": data_scope or "executive_overview",
+                "scope_hint": (shaped_context or {}).get("scope_hint"),
                 "shape_version": (shaped_context or {}).get("shape_version"),
+                "ambiguous_entities": bool((shaped_context or {}).get("ambiguous_entities")),
                 "keys": list((shaped_context or {}).keys()),
             },
         )
     context_meta = _build_context_meta(
         intent_label,
-        date_from or conversation.date_from,
-        date_to or conversation.date_to,
+        eff_from,
+        eff_to,
         shaped_context,
         data_scope=data_scope,
     )
     context_meta.update({"deterministic_hit": deterministic_hit, "cache_hit": cache_hit, "llm_used": llm_used})
+    if intent_label == InsightMessage.IntentLabel.DASHBOARD_QUERY:
+        context_meta.update(
+            {
+                "date_window_source": date_trace.get("source"),
+                "active_timeframe": extraction.get("active_timeframe") or session_state0.get("active_timeframe"),
+                "active_topic": extraction.get("active_topic") or session_state0.get("active_topic"),
+                "utterance_temporal_hit": extraction.get("temporal_matched"),
+            }
+        )
     print("[insights-chat] context meta", context_meta)
 
     user_row = InsightMessage.objects.create(
@@ -1877,7 +3158,7 @@ def chat_with_insights_assistant(
     )
     print("[insights-chat] user message saved", {"message_id": user_row.id})
 
-    static_reply = _chat_response_for_non_dashboard(intent_label)
+    static_reply = _chat_response_for_non_dashboard(intent_label, safety_flags=safety_flags)
     if static_reply:
         print("[insights-chat] static response path", {"intent_label": intent_label})
         assistant_row = InsightMessage.objects.create(
@@ -1937,6 +3218,14 @@ def chat_with_insights_assistant(
             token_output=llm_output["usage"]["output"],
             finish_reason=llm_output["finish_reason"],
         )
+        if intent_label == InsightMessage.IntentLabel.DASHBOARD_QUERY:
+            _persist_chat_session_state(
+                conversation,
+                extraction=extraction,
+                eff_from=eff_from,
+                eff_to=eff_to,
+                date_trace=date_trace,
+            )
         return {
             "conversationId": conversation.id,
             "messageId": assistant_row.id,
@@ -1959,6 +3248,14 @@ def chat_with_insights_assistant(
             model=_llm_model(),
             error_payload={"error": str(exc)},
         )
+        if intent_label == InsightMessage.IntentLabel.DASHBOARD_QUERY:
+            _persist_chat_session_state(
+                conversation,
+                extraction=extraction,
+                eff_from=eff_from,
+                eff_to=eff_to,
+                date_trace=date_trace,
+            )
         return {
             "conversationId": conversation.id,
             "messageId": assistant_row.id,
@@ -1979,8 +3276,31 @@ def list_insight_messages(user, conversation_id: int) -> list[InsightMessage]:
     return list(conversation.messages.filter(deleted_at__isnull=True).order_by("created_at"))
 
 
-def generate_dashboard_insights(date_from, date_to, user) -> dict[str, Any]:
-    ctx = gather_insights_context(date_from, date_to, user)
+def generate_dashboard_insights(
+    date_from,
+    date_to,
+    user,
+    *,
+    installer=None,
+    sales_team=None,
+    lead_source=None,
+    project_manager=None,
+    market=None,
+    rep_kind=None,
+    rep_name=None,
+) -> dict[str, Any]:
+    ctx = gather_insights_context(
+        date_from,
+        date_to,
+        user,
+        installer=installer,
+        sales_team=sales_team,
+        lead_source=lead_source,
+        project_manager=project_manager,
+        market=market,
+        rep_kind=rep_kind,
+        rep_name=rep_name,
+    )
     if not _forge_api_key():
         return _heuristic_insights_from_context(ctx)
 

@@ -32,6 +32,10 @@ def _collect_filter_values(request):
             "projectManager",
             "project_manager",
             "market",
+            "rep_kind",
+            "repKind",
+            "rep_name",
+            "repName",
         )
         for key in keys:
             if hasattr(data, "get"):
@@ -54,6 +58,18 @@ def _resolve_filter(merged, candidates):
         text = str(val).strip()
         if text:
             return text
+    return None
+
+
+def normalize_rep_kind(raw):
+    """API / UI → internal rep dimension for project filtering."""
+    if raw is None:
+        return None
+    s = str(raw).strip().lower().replace("-", "_")
+    if s in ("sales_rep", "salesrep", "rep", "closer", "sales", "closer_rep"):
+        return "sales_rep"
+    if s in ("setter", "appointment_setter"):
+        return "setter"
     return None
 
 
@@ -93,10 +109,12 @@ def parse_dashboard_filters_full(request):
     -------
     dict with keys:
         date_from, date_to, installer, sales_team,
-        lead_source, manager, market
+        lead_source, manager, market, rep_kind, rep_name
     """
     date_from, date_to = parse_dashboard_date_range(request)
     merged = _collect_filter_values(request)
+    rk = normalize_rep_kind(_resolve_filter(merged, ("rep_kind", "repKind")))
+    rn = _resolve_filter(merged, ("rep_name", "repName"))
     return {
         "date_from": date_from,
         "date_to": date_to,
@@ -105,6 +123,8 @@ def parse_dashboard_filters_full(request):
         "lead_source": _resolve_filter(merged, ("lead_source", "leadSource")),
         "manager": _resolve_filter(merged, ("manager", "projectManager", "project_manager")),
         "market": _resolve_filter(merged, ("market",)),
+        "rep_kind": rk,
+        "rep_name": rn if rn else None,
     }
 
 

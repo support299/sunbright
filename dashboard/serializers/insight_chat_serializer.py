@@ -8,6 +8,22 @@ class InsightChatRequestSerializer(serializers.Serializer):
     message = serializers.CharField(max_length=4000)
     dateFrom = serializers.DateField(required=False)
     dateTo = serializers.DateField(required=False)
+    salesTeam = serializers.CharField(max_length=255, required=False, allow_blank=True)
+    installer = serializers.CharField(max_length=255, required=False, allow_blank=True)
+    leadSource = serializers.CharField(max_length=255, required=False, allow_blank=True)
+    manager = serializers.CharField(max_length=255, required=False, allow_blank=True)
+    market = serializers.CharField(max_length=255, required=False, allow_blank=True)
+    repKind = serializers.CharField(max_length=32, required=False, allow_blank=True)
+    repName = serializers.CharField(max_length=255, required=False, allow_blank=True)
+
+    def validate(self, attrs):
+        from dashboard.utils import normalize_rep_kind
+
+        rk = normalize_rep_kind(attrs.get("repKind"))
+        attrs["repKind"] = rk
+        rn = (attrs.get("repName") or "").strip() or None
+        attrs["repName"] = rn if rk else None
+        return attrs
 
 
 class InsightConversationSerializer(serializers.ModelSerializer):

@@ -7,7 +7,7 @@ from operator import or_
 
 from django.db.models import Q
 
-from dashboard.models import DashboardDataScope
+from dashboard.models import DashboardDataScope, SunbaseUser
 
 
 def _or_team_q(field: str, names: list[str]) -> Q:
@@ -96,3 +96,35 @@ def cx_scope_q(user) -> Q:
     if user is None or getattr(user, "is_staff", False) or not getattr(user, "is_authenticated", False):
         return Q()
     return Q(pk__in=[])
+
+
+def scoped_sunbase_users(user):
+    """Sunbase directory rows visible under the same dashboard data scope as facts."""
+    qs = SunbaseUser.objects.all()
+    if user is None or getattr(user, "is_staff", False) or not getattr(user, "is_authenticated", False):
+        return qs
+    try:
+        ds = user.dashboard_scope
+    except DashboardDataScope.DoesNotExist:
+        return SunbaseUser.objects.none()
+
+    kind = ds.scope_kind
+    if kind == DashboardDataScope.ScopeKind.TEAM:
+        if not (ds.sales_team or "").strip():
+            return SunbaseUser.objects.none()
+        t = ds.sales_team.strip()
+        return qs.filter(Q(crew_name__iexact=t) | Q(team__name__iexact=t))
+
+    if kind == DashboardDataScope.ScopeKind.TEAMS:
+        names = [n.strip() for n in (ds.sales_teams or []) if isinstance(n, str) and n.strip()]
+        if not names:
+            return SunbaseUser.objects.none()
+        team_q = reduce(or_, (Q(crew_name__iexact=n) | Q(team__name__iexact=n) for n in names))
+        return qs.filter(team_q)
+
+    if kind == DashboardDataScope.ScopeKind.REP:
+        if not (ds.sales_rep or "").strip():
+            return SunbaseUser.objects.none()
+        return qs.filter(full_name__iexact=ds.sales_rep.strip())
+
+    return SunbaseUser.objects.none()

@@ -130,4 +130,9 @@ CELERY_BEAT_SCHEDULE = {
         "schedule": crontab(hour=20, minute=0),
         "options": {"queue": "sunbright"},
     },
+    "sunbase-full-sync-test": {
+        "task": "dashboard.run_sunbase_full_sync",
+        "schedule": crontab(minute="*"),  # every minute — remove after testing
+        "options": {"queue": "sunbright"},
+    },
 }

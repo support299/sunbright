@@ -1,5 +1,7 @@
 import os
 from pathlib import Path
+
+from celery.schedules import crontab
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -100,3 +102,32 @@ GOOGLE_OAUTH_ADMIN_EMAILS = frozenset(
 # OpenAI: set BUILT_IN_FORGE_API_URL=https://api.openai.com and BUILT_IN_FORGE_MODEL=gpt-4o-mini (or gpt-4o, etc.).
 # Forge-only `thinking` is omitted automatically when the URL contains openai.com (or set BUILT_IN_FORGE_SKIP_THINKING=true).
 # max_tokens defaults to 16384 for api.openai.com (model limit); override with BUILT_IN_FORGE_MAX_TOKENS if needed.
+
+# Celery + Redis: automated Sunbase sync (see dashboard.tasks.run_sunbase_full_sync_task).
+# Use Redis DB 1 + queue "sunbright" so we do not consume stale tasks from other apps on DB 0.
+# On Windows, run the worker with: celery -A backend worker -l info --pool=solo -Q sunbright
+CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://127.0.0.1:6379/1")
+CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", CELERY_BROKER_URL)
+CELERY_TASK_DEFAULT_QUEUE = "sunbright"
+CELERY_TASK_ROUTES = {
+    "dashboard.*": {"queue": "sunbright"},
+}
+CELERY_ACCEPT_CONTENT = ["json"]
+CELERY_TASK_SERIALIZER = "json"
+CELERY_RESULT_SERIALIZER = "json"
+CELERY_TASK_TRACK_STARTED = True
+CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
+CELERY_TIMEZONE = os.getenv("CELERY_TIMEZONE", "America/New_York")
+CELERY_ENABLE_UTC = True
+CELERY_BEAT_SCHEDULE = {
+    "sunbase-full-sync-10am": {
+        "task": "dashboard.run_sunbase_full_sync",
+        "schedule": crontab(hour=10, minute=0),
+        "options": {"queue": "sunbright"},
+    },
+    "sunbase-full-sync-8pm": {
+        "task": "dashboard.run_sunbase_full_sync",
+        "schedule": crontab(hour=20, minute=0),
+        "options": {"queue": "sunbright"},
+    },
+}

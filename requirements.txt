@@ -7,3 +7,5 @@ python-dotenv
 psycopg2-binary
 gunicorn
 requests
+celery[redis]>=5.3
+redis>=5.0
